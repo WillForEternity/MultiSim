@@ -7,11 +7,11 @@
 #include <time.h>
 
 // --- Hyperparameters ---
-const double ACTOR_LR = 0.001;
-const double CRITIC_LR = 0.001;
+const double ACTOR_LR = 0.05;
+const double CRITIC_LR = 0.05;
 const double GAMMA = 0.9;
-const double ALPHA_ENTROPY = 0.01;
-const double POLYAK = 0.01;
+const double ALPHA_ENTROPY = 0.05;
+const double POLYAK = 0.05;
 
 // --- Adam parameters ---
 const AdamParams adamDefault = {0.001, 0.9, 0.999, 1e-8};
