@@ -624,7 +624,7 @@ static void updateSensorsAndControl(Quadruped *quad)
     
     // Reward for advancing at least 3 units closer.
     if ((quad->prevTargetDistance - currentTargetDistance) >= 1.0) {
-        reward += 200.0;
+        reward += 500.0;
     }
     quad->prevTargetDistance = currentTargetDistance;
     
@@ -634,7 +634,7 @@ static void updateSensorsAndControl(Quadruped *quad)
         double lineX = obsPos[0] + 0.5;
         if ((quad->prevX < lineX && bodyPos[0] >= lineX) ||
             (quad->prevX > lineX && bodyPos[0] <= lineX))
-            reward += 250.0;
+            reward += 500.0;
     }
     quad->prevX = bodyPos[0];
     quad->prevY = bodyPos[1];
@@ -654,7 +654,7 @@ static void updateSensorsAndControl(Quadruped *quad)
     
     // Blinking feedback.
     if (quad->blinkCount == 0) {
-        if (reward >= 50.0) {
+        if (reward >= 0) {
             quad->blinkType = BLINK_GREEN;
             quad->blinkCount = 2;
             quad->blinkStartTime = simulationTime;
@@ -680,20 +680,20 @@ static void updateSensorsAndControl(Quadruped *quad)
     switch (state) {
         case 0:
             for (int i = 0; i < 4; i++) {
-                dJointSetHingeParam(quad->wheelJoint[i], dParamVel, -30);
+                dJointSetHingeParam(quad->wheelJoint[i], dParamVel, -40);
             }
             break;
         case 1:
-            dJointSetHingeParam(quad->wheelJoint[0], dParamVel, -30);
-            dJointSetHingeParam(quad->wheelJoint[2], dParamVel, -30);
-            dJointSetHingeParam(quad->wheelJoint[1], dParamVel, 30);
-            dJointSetHingeParam(quad->wheelJoint[3], dParamVel, 30);
+            dJointSetHingeParam(quad->wheelJoint[0], dParamVel, -40);
+            dJointSetHingeParam(quad->wheelJoint[2], dParamVel, -40);
+            dJointSetHingeParam(quad->wheelJoint[1], dParamVel, 10);
+            dJointSetHingeParam(quad->wheelJoint[3], dParamVel, 10);
             break;
         case 2:
-            dJointSetHingeParam(quad->wheelJoint[0], dParamVel, 30);
-            dJointSetHingeParam(quad->wheelJoint[2], dParamVel, 30);
-            dJointSetHingeParam(quad->wheelJoint[1], dParamVel, -30);
-            dJointSetHingeParam(quad->wheelJoint[3], dParamVel, -30);
+            dJointSetHingeParam(quad->wheelJoint[0], dParamVel, 40);
+            dJointSetHingeParam(quad->wheelJoint[2], dParamVel, 40);
+            dJointSetHingeParam(quad->wheelJoint[1], dParamVel, -10);
+            dJointSetHingeParam(quad->wheelJoint[3], dParamVel, -10);
             break;
         case 3:
             for (int i = 0; i < 4; i++) {
