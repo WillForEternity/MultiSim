@@ -15,13 +15,12 @@
 #include <time.h>
 #include <GLUT/glut.h>
 
-// --- Blink color definitions ---
+// --- Visual behavior feedback ---
 #define BLINK_NONE  0
 #define BLINK_BLUE  1   // for considerable weight change
 #define BLINK_GREEN 2   // for reward
 #define BLINK_RED   3   // for punishment
 
-// --- Network related definitions (must match neural_network.h) ---
 #define ACTOR_OUTPUTS 4
 
 // External neural network functions.
@@ -32,11 +31,6 @@ extern "C" {
     extern double globalWeightChangeBlink;
     extern bool globalInitNetworkCalled;
 }
-
-// Forward declarations for helper functions.
-static void safeNormalizeBodyRotation(dBodyID body);
-static void drawText(const char* text, float x, float y);
-static void drawObstacleLines(void);
 
 // Simulation and geometry settings.
 #define NUM_QUADRUPEDS    50
@@ -120,6 +114,9 @@ static void replaceQuadruped(int index);
 static double randomUniform(double min, double max);
 static void updateSensorsAndControl(Quadruped *quad);
 static void createQuadruped(Quadruped *quad, double x, double y);
+static void safeNormalizeBodyRotation(dBodyID body);
+static void drawText(const char* text, float x, float y);
+static void drawObstacleLines(void);
 
 /******************************************************************************
  * Helper: Check if rotation matrix is invalid.
