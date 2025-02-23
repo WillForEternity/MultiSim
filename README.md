@@ -10,7 +10,7 @@
 
 ## Overview
 
-MultiSim’s primary goal is to train wheeled quadrupeds to navigate complex, ever-changing environments. The system comprises two core components:
+MultiSim’s primary goal is to train wheeled quadrupeds to navigate complex, dynamic environments. The system comprises two core components:
 
 - **Physics-Based Simulation:**  
   Uses ODE to simulate realistic rigid-body dynamics, collision detection, ray casting, and environmental interactions. The simulation creates a dynamic obstacle course with boundary walls, a target object, and thousands of randomly placed obstacles. Each quadruped is modeled as a composite of a central body, legs, and wheels. A grid of ray "sensors" attached to the body provides distance measurements for obstacle detection.
