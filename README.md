@@ -34,14 +34,13 @@ Ensure you have:
 - A C++14-compliant compiler (e.g., g++-14)
 - The Open Dynamics Engine (https://www.ode.org, https://bitbucket.org/odedevs/ode/downloads/) 
 - OpenGL and GLUT for graphics
-On macOS, you might use Homebrew; on Linux, use your package manager to install the necessary libraries.
 
 3. **Compile and Run**
-You can compile using the provided Makefile or directly with (worked for me (m3 Macbook Air) but some fiddling may be necessary):
+You can compile using the provided Makefile or directly with:
 ```bash
 g++-14 -stdlib=libc++ -I/usr/local/include -L/usr/local/lib -o multiSim2 environment.cpp neural_network.cpp main.cpp -lode -ldrawstuff -lm -framework GLUT -framework OpenGL -fopenmp
 ```
-Adjust the include and library paths if necessary. To run the simulation, simply execute the compiled binary:
+This compile command worked for me (m3 Macbook Air) but some fiddling may be needed. Adjust the include and library paths if necessary. To run the simulation, execute the compiled binary, of course:
 ```bash
 ./multiSim2
 ```
