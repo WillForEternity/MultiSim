@@ -20,28 +20,110 @@ MultiSim’s primary goal is to train wheeled quadrupeds to navigate complex, ev
 
 ## Technical Details
 
-### Simulation Engine (Environment)
+### Simulation Engine
 
-- **Physics & Rendering:**  
-  - Built on ODE and Drawstuff, the engine sets up the world with gravity, boundaries, and static obstacles.
-  - Each quadruped comprises a body, legs, and wheels, represented as separate rigid bodies connected by hinge joints.
-  - A 5×5 grid of ray sensors (total 25 rays) arranged as a cone is mounted on each quadruped to detect obstacles and gauge the environment.
+- **Environment Setup:**  
+  - **ODE & Drawstuff:** The simulation uses ODE to create the physical world (setting gravity, boundaries, obstacles, and bodies) and Drawstuff for real-time visualization.
+  - **Quadruped Model:** Each quadruped consists of a body, four legs, and four wheels. Rigid bodies are connected with hinge joints that enforce physical constraints and limits.
+  - **Sensors:**  
+    A 5×5 grid (totaling 25 rays) of ray sensors is attached to each quadruped. These sensors emit rays in a cone around the forward direction, measuring the distance to obstacles and the ground. An additional sensor (the distance to the target) is appended, forming an input vector of dimension `NUM_INPUTS = 25 + 1`.
 
 - **Control Loop & Collision Handling:**  
-  - The simulation loop updates sensor readings, computes rewards (e.g., for reducing distance to a target or crossing obstacles), and applies penalties for collisions or falling.
-  - Collision callbacks adjust the quadruped’s fitness and penalize contacts with obstacles, walls, or improper leg collisions.
+  - The simulation loop runs with a fixed timestep (`SIMULATION_DT`) where:
+    - Sensor values are updated by casting rays.
+    - A reward is computed based on progress toward the target (e.g., moving closer, crossing obstacle lines) and penalties are applied for collisions or falling.
+    - The neural network processes sensor inputs to determine wheel joint velocities.
+  - Collision callbacks handle interactions with obstacles and walls, applying fitness penalties for undesirable contacts.
 
-### Neural Network (Actor–Critic)
+### Neural Network Architecture
 
-- **Network Architecture:**  
-  - **Actor Network:** A two-layer feedforward network with ReLU activation in the hidden layer followed by a softmax output layer that produces a probability distribution over four discrete actions.
-  - **Critic Network:** Similarly structured to estimate the state’s value.
+#### Actor Network
 
-- **Training Mechanism:**  
-  - **Forward Pass:** Sensor inputs and the target distance are processed to compute outputs for both the actor and critic.
-  - **Reward and TD Error:** Rewards are computed based on progress toward the target and successful obstacle crossings, while penalties are applied for collisions and falling. The temporal-difference error is calculated and used to derive an advantage signal.
-  - **Backpropagation:** Gradients for both networks are computed using the advantage signal and updated with the Adam optimizer. A Polyak update smooths the target critic network’s parameters.
-  - **Visual Feedback:** A blinking effect on the quadruped indicates significant weight changes or rewards/penalties.
+- **Structure:**  
+  - **Input Layer:** Dimension `NUM_INPUTS` (sensor grid + target distance).
+  - **Hidden Layer:** Consists of `HIDDEN_SIZE` neurons with ReLU activation.
+  - **Output Layer:** Consists of 4 neurons corresponding to the four possible actions.
+  - **Softmax Layer:** Converts the output logits to a probability distribution over actions.
+
+- **Forward Pass (Mathematical Formulation):**  
+  1. **Hidden Activation:**  
+     \[
+     \mathbf{z}^{(1)} = W_1 \mathbf{x} + \mathbf{b}_1, \quad \mathbf{h} = \text{ReLU}(\mathbf{z}^{(1)})
+     \]
+  2. **Output Layer:**  
+     \[
+     \mathbf{z}^{(2)} = W_2 \mathbf{h} + \mathbf{b}_2
+     \]
+  3. **Policy (Softmax):**  
+     \[
+     \pi_i = \frac{\exp(z^{(2)}_i)}{\sum_{j=1}^{4} \exp(z^{(2)}_j)} \quad \text{for } i = 1, \dots, 4
+     \]
+  4. **Entropy Calculation:**  
+     \[
+     H(\pi) = -\sum_{i=1}^{4} \pi_i \log \pi_i
+     \]
+
+#### Critic Network
+
+- **Structure:**  
+  - **Input Layer:** Same as actor.
+  - **Hidden Layer:** Uses `HIDDEN_SIZE` neurons with ReLU activation.
+  - **Output Layer:** A single neuron that outputs the estimated state value.
+
+- **Forward Pass (Mathematical Formulation):**  
+  \[
+  v = W_{c2} \, \text{ReLU}(W_{c1} \mathbf{x} + \mathbf{b}_{c1}) + b_{c2}
+  \]
+
+#### Learning Algorithm and Weight Updates
+
+1. **Temporal-Difference Error:**  
+   Compute the TD error using the current reward \( r \), discount factor \( \gamma \), and target critic value \( v_{\text{target}} \):
+   \[
+   \delta = r + \gamma \, v_{\text{target}} - v
+   \]
+   where \( v \) is the current critic value and \( v_{\text{target}} \) is obtained from a target network updated via Polyak averaging.
+
+2. **Advantage Calculation:**  
+   Incorporate an entropy bonus (with coefficient \( \alpha \)) to encourage exploration:
+   \[
+   A = \delta + \alpha \, H(\pi)
+   \]
+
+3. **Actor Gradient:**  
+   For a chosen action \( a \) (obtained by sampling from the policy \( \pi \)), the gradient for the actor is computed as:
+   \[
+   \nabla L_{\text{actor}} = -\left( \mathbf{1}_{\{i=a\}} - \pi \right) \cdot A
+   \]
+   This gradient is backpropagated through the actor network to update \( W_2, \mathbf{b}_2, W_1, \) and \( \mathbf{b}_1 \).
+
+4. **Critic Gradient:**  
+   The critic network’s weights are updated to minimize the TD error:
+   \[
+   \nabla L_{\text{critic}} = \delta \cdot \nabla v
+   \]
+
+5. **Adam Optimizer:**  
+   Both networks use the Adam optimizer for parameter updates. For each parameter \( \theta \) with gradient \( g \), the update is computed as:
+   \[
+   m = \beta_1 \, m + (1 - \beta_1) \, g, \quad v = \beta_2 \, v + (1 - \beta_2) \, g^2
+   \]
+   Bias-corrected estimates:
+   \[
+   \hat{m} = \frac{m}{1 - \beta_1^t}, \quad \hat{v} = \frac{v}{1 - \beta_2^t}
+   \]
+   Update step:
+   \[
+   \theta \leftarrow \theta + \eta \, \frac{\hat{m}}{\sqrt{\hat{v}} + \epsilon}
+   \]
+   Here, \( \eta \) is the learning rate (set separately for actor and critic), \( \beta_1 \) and \( \beta_2 \) are the Adam decay rates, and \( \epsilon \) is a small constant for numerical stability.
+
+6. **Polyak Averaging (Target Network Update):**  
+   The target critic network parameters \( \theta_{\text{target}} \) are updated as:
+   \[
+   \theta_{\text{target}} \leftarrow \rho \, \theta + (1 - \rho) \, \theta_{\text{target}}
+   \]
+   where \( \rho \) (POLYAK) is a small constant (e.g., 0.01) ensuring smooth updates.
 
 ---
 
