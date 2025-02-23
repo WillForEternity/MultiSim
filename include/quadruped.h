@@ -1,5 +1,3 @@
-// quadruped.h
-
 #ifndef QUADRUPED_H
 #define QUADRUPED_H
 
@@ -52,6 +50,11 @@ typedef struct Quadruped {
     int blinkType;
     int blinkCount;
     double blinkStartTime;
+    
+    // New members for position and orientation.
+    double x;
+    double y;
+    double orientation;
 } Quadruped;
 
 #endif // QUADRUPED_H

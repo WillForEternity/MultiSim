@@ -155,10 +155,19 @@ static double computeEntropy(const double *p, int n) {
 void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_OUTPUTS])
 {
     double input[NUM_INPUTS];
+    // --- Build the input vector ---
+    // 1. Sensor ray values.
     for (int i = 0; i < NUM_RAYS; i++) {
         input[i] = quad->sensorValues[i];
     }
+    // 2. Target distance.
     input[NUM_RAYS] = quad->distanceToTarget;
+    // 3. Current x position.
+    input[NUM_RAYS + 1] = quad->x;
+    // 4. Current y position.
+    input[NUM_RAYS + 2] = quad->y;
+    // 5. Current orientation.
+    input[NUM_RAYS + 3] = quad->orientation;
     
     // --- Actor forward pass ---
     double actor_z1[HIDDEN_SIZE], actor_h1[HIDDEN_SIZE];
@@ -296,6 +305,6 @@ void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_O
     polyakUpdate();
     
     // --- Global weight change blink trigger ---
-    if (fabs(td_error) > 5000.0)
+    if (fabs(td_error) > 10000.0)
         globalWeightChangeBlink = 1.0;
 }

@@ -1,5 +1,6 @@
 // environment.cpp
-// Compile with: g++-14 -stdlib=libc++ -I/usr/local/include -L/usr/local/lib -o multiSim2 environment.cpp neural_network.cpp main.cpp -lode -ldrawstuff -lm -framework GLUT -framework OpenGL -fopenmp
+
+// compile: g++-14 -stdlib=libc++ -I/usr/local/include -L/usr/local/lib -o multiSim2 src/environment.cpp src/neural_network.cpp -lode -ldrawstuff -lm -framework GLUT -framework OpenGL -fopenmp
 
 #define GL_SILENCE_DEPRECATION
 
@@ -623,8 +624,17 @@ static void updateSensorsAndControl(Quadruped *quad)
     double reward = 0.0;
     
     // Reward for advancing at least 3 units closer.
-    if ((quad->prevTargetDistance - currentTargetDistance) >= 1.0) {
+    if ((quad->prevTargetDistance - currentTargetDistance) >= 3.0) {
+        reward += 5000.0;
+    }
+    else if ((quad->prevTargetDistance - currentTargetDistance) >= 1.5) {
+        reward += 2500.0;
+    }
+    else if ((quad->prevTargetDistance - currentTargetDistance) >= 0.5) {
         reward += 500.0;
+    }
+    else { 
+        reward -= 500.0;
     }
     quad->prevTargetDistance = currentTargetDistance;
     
@@ -639,14 +649,7 @@ static void updateSensorsAndControl(Quadruped *quad)
     quad->prevX = bodyPos[0];
     quad->prevY = bodyPos[1];
     
-    // Check for fall or collision penalty.
-    if (hasFallen(quad)) {
-        reward = -500.0;
-        double dummy[ACTOR_OUTPUTS];
-        runNeuralNetwork(quad, reward, dummy);
-        replaceQuadruped(0);
-        return;
-    }
+    // Check collision penalty.
     if (quad->collisionPenalty < 0) {
         reward = -500.0;
         quad->collisionPenalty = 0.0;
