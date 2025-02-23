@@ -1,6 +1,6 @@
 # MultiSim
 
-**MultiSim** is a simulation framework that integrates a physics-based engine with an actor–critic reinforcement learning algorithm to enable wheeled quadrupeds to learn navigation in dynamic obstacle courses. The project is implemented in C++ using the Open Dynamics Engine (ODE) for physics simulation and Drawstuff for visualization, while the neural network is built from scratch with an actor–critic architecture.
+**MultiSim** is a simulation framework that integrates a physics-based engine with an actor–critic reinforcement learning algorithm to enable wheeled quadrupeds to learn navigation in dynamic obstacle courses. The project is implemented in C++ using the Open Dynamics Engine (ODE) for physics simulation and visualization, while the neural network is built from scratch with an actor–critic architecture.
 
 ---
 
@@ -9,10 +9,10 @@
 MultiSim’s primary goal is to train wheeled quadrupeds to navigate complex, ever-changing environments. The system comprises two core components:
 
 - **Physics-Based Simulation:**  
-  Uses ODE to simulate realistic rigid-body dynamics, collision detection, and environmental interactions. The simulation creates a dynamic obstacle course with randomly placed obstacles, boundary walls, and a target object. Each quadruped is modeled as a composite of a central body, legs, and wheels. A grid of ray sensors attached to the body provides distance measurements for obstacle detection.
+  Uses ODE to simulate realistic rigid-body dynamics, collision detection, ray casting, and environmental interactions. The simulation creates a dynamic obstacle course with boundary walls, a target object, and thousands of randomly placed obstacles. Each quadruped is modeled as a composite of a central body, legs, and wheels. A grid of ray "sensors" attached to the body provides distance measurements for obstacle detection.
 
 - **Actor–Critic Reinforcement Learning:**  
-  The learning algorithm is based on an actor–critic framework. The **actor network** outputs one of four possible control actions (e.g., different wheel velocities for turning or moving straight), while the **critic network** estimates the value of the current state. Temporal-difference (TD) learning updates both networks using gradients computed via the Adam optimizer and utilizes Polyak averaging for stable target updates.
+  The learning algorithm is based on an actor–critic framework. The **actor network** outputs one of four possible control actions (e.g., different wheel velocities for forward, turning, or backwards movement), while the **critic network** estimates the value of the current state. Temporal-difference (TD) learning updates both networks using gradients computed via the Adam optimizer and utilizes Polyak averaging for stable target updates.
 
 ---
 
@@ -23,10 +23,10 @@ MultiSim’s primary goal is to train wheeled quadrupeds to navigate complex, ev
 - **Physics & Rendering:**  
   - Built on ODE and Drawstuff, the engine sets up the world with gravity, boundaries, and static obstacles.
   - Each quadruped comprises a body, legs, and wheels, represented as separate rigid bodies connected by hinge joints.
-  - A 5×5 grid of ray sensors (total 25 rays) is mounted on each quadruped to detect obstacles and gauge the environment.
+  - A 5×5 grid of ray sensors (total 25 rays) arranged as a cone is mounted on each quadruped to detect obstacles and gauge the environment.
 
 - **Control Loop & Collision Handling:**  
-  - The simulation loop updates sensor readings, computes rewards (e.g., for reducing distance to a target or crossing obstacle lines), and applies penalties for collisions or falling.
+  - The simulation loop updates sensor readings, computes rewards (e.g., for reducing distance to a target or crossing obstacles), and applies penalties for collisions or falling.
   - Collision callbacks adjust the quadruped’s fitness and penalize contacts with obstacles, walls, or improper leg collisions.
 
 ### Neural Network (Actor–Critic)
