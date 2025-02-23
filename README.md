@@ -6,7 +6,7 @@
 
 ---
 
-# in progress...
+# Development in progress...
 
 ## Overview
 
