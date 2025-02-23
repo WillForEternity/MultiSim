@@ -305,6 +305,6 @@ void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_O
     polyakUpdate();
     
     // --- Global weight change blink trigger ---
-    if (fabs(td_error) > 10000.0)
+    if (fabs(td_error) > 100000.0)
         globalWeightChangeBlink = 1.0;
 }

@@ -2,11 +2,11 @@
 #define NEURAL_NETWORK_H
 
 #include "quadruped.h"  
-#include "common.h"     // For macros like NUM_RAYS, SENSOR_RAY_GRID, etc.
+#include "common.h"     // For macros like SENSOR_RAY_GRID, etc.
 
 // --- Network settings ---
-#define SENSOR_RAY_GRID   5
-#define NUM_RAYS          (SENSOR_RAY_GRID * SENSOR_RAY_GRID)
+// Increase the number of rays for full circle sensing.
+#define NUM_RAYS          32
 #define NUM_INPUTS        (NUM_RAYS + 4)   // sensor rays + target distance + x and y coordinate + orientation
 #define ACTOR_OUTPUTS     4                // 4 discrete wheel commands
 #define HIDDEN_SIZE       32

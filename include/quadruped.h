@@ -4,10 +4,8 @@
 #include <ode/ode.h>
 #include "common.h"  
 
-#ifndef NUM_RAYS
-#define SENSOR_RAY_GRID   5
-#define NUM_RAYS          (SENSOR_RAY_GRID * SENSOR_RAY_GRID)
-#endif
+// Use 32 rays for full-circle sensing.
+#define NUM_RAYS 32
 
 typedef struct Quadruped {
     dBodyID body;

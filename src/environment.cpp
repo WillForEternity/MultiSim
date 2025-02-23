@@ -38,11 +38,9 @@ extern "C" {
 #define SIMULATION_DT     0.015
 
 // Sensor parameters.
-#define SENSOR_RAY_GRID   5
-#define NUM_RAYS          (SENSOR_RAY_GRID * SENSOR_RAY_GRID)
-#define SENSOR_MAX_DIST   4.0
+#define SENSOR_MAX_DIST   3.0
 #define SENSOR_CONE_ANGLE (M_PI/6.0)
-#define DRAWN_MAX_LENGTH  4.0
+#define DRAWN_MAX_LENGTH  3.0
 
 // Body and leg parameters.
 #define BODY_LENGTH       0.4
@@ -414,6 +412,27 @@ void cleanupODE(void)
 }
 
 /******************************************************************************
+ * helper: convert HSV to RGB
+ ******************************************************************************/
+// Converts HSV (h in [0,360], s and v in [0,1]) to RGB in [0,1].
+static void hsv2rgb(double h, double s, double v, float &r, float &g, float &b) {
+    double c = v * s;
+    double h_prime = fmod(h / 60.0, 6);
+    double x = c * (1 - fabs(fmod(h_prime, 2) - 1));
+    double m = v - c;
+    double r1, g1, b1;
+    if (0 <= h_prime && h_prime < 1) { r1 = c; g1 = x; b1 = 0; }
+    else if (1 <= h_prime && h_prime < 2) { r1 = x; g1 = c; b1 = 0; }
+    else if (2 <= h_prime && h_prime < 3) { r1 = 0; g1 = c; b1 = x; }
+    else if (3 <= h_prime && h_prime < 4) { r1 = 0; g1 = x; b1 = c; }
+    else if (4 <= h_prime && h_prime < 5) { r1 = x; g1 = 0; b1 = c; }
+    else { r1 = c; g1 = 0; b1 = x; }
+    r = (float)(r1 + m);
+    g = (float)(g1 + m);
+    b = (float)(b1 + m);
+}
+
+/******************************************************************************
  * getEnvironmentHeight: Return environment height at a point.
  ******************************************************************************/
 static double getEnvironmentHeight(double x, double y)
@@ -492,6 +511,10 @@ static void nearCallback(void *data, dGeomID o1, dGeomID o2)
         dJointID c = dJointCreateContact(world, contactGroup, &contacts[i]);
         dJointAttach(c, dGeomGetBody(o1), dGeomGetBody(o2));
         
+        // *** Filter out ground collisions from triggering punishments ***
+        if (o1 == groundPlaneGeom || o2 == groundPlaneGeom)
+            continue;
+        
         void* data1 = dGeomGetData(o1);
         void* data2 = dGeomGetData(o2);
         
@@ -533,7 +556,7 @@ static void nearCallback(void *data, dGeomID o1, dGeomID o2)
             }
         }
         
-        // --- New: Handle collisions with walls ---
+        // --- Handle collisions with walls ---
         if (data1 == (void*)SIDE_WALL || data1 == (void*)SPAWN_WALL || data1 == (void*)FAR_WALL) {
             dBodyID b = dGeomGetBody(o2);
             if (b) {
@@ -568,77 +591,92 @@ static int hasFallen(Quadruped *quad)
  ******************************************************************************/
 static void updateSensorsAndControl(Quadruped *quad)
 {
+    // Get current body position and rotation.
     const dReal *bodyPos = dBodyGetPosition(quad->body);
-    
-    // Update sensor rays.
-    for (int i = 0; i < SENSOR_RAY_GRID; i++) {
-        for (int j = 0; j < SENSOR_RAY_GRID; j++) {
-            int idx = i * SENSOR_RAY_GRID + j;
-            double horiz = (((double)j - (SENSOR_RAY_GRID - 1) / 2.0) * (SENSOR_CONE_ANGLE / (SENSOR_RAY_GRID - 1)));
-            double vert = (((double)i - (SENSOR_RAY_GRID - 1) / 2.0) * (SENSOR_CONE_ANGLE / (SENSOR_RAY_GRID - 1)));
-            double cosVert = cos(vert), sinVert = sin(vert);
-            double cosHoriz = cos(horiz), sinHoriz = sin(horiz);
-            dVector3 rayDir;
-            const dReal *bodyR = dBodyGetRotation(quad->body);
-            dVector3 forward = { bodyR[0], bodyR[4], bodyR[8] };
-            dVector3 right   = { bodyR[1], bodyR[5], bodyR[9] };
-            dVector3 up      = { bodyR[2], bodyR[6], bodyR[10] };
-            rayDir[0] = cosVert * cosHoriz * forward[0] + cosVert * sinHoriz * right[0] + sinVert * up[0];
-            rayDir[1] = cosVert * cosHoriz * forward[1] + cosVert * sinHoriz * right[1] + sinVert * up[1];
-            rayDir[2] = cosVert * cosHoriz * forward[2] + cosVert * sinHoriz * right[2] + sinVert * up[2];
-            double sensorX = bodyPos[0] + forward[0] * (BODY_LENGTH * 0.5);
-            double sensorY = bodyPos[1] + forward[1] * (BODY_LENGTH * 0.5);
-            double sensorZ = bodyPos[2];
-            dGeomRaySet(quad->raySensors[idx], sensorX, sensorY, sensorZ, rayDir[0], rayDir[1], rayDir[2]);
-            
-            double minReading = 1.0;
-            dContactGeom contact;
-            int n = dCollide(quad->raySensors[idx], groundPlaneGeom, 1, &contact, sizeof(dContactGeom));
+    const dReal *bodyR = dBodyGetRotation(quad->body);
+
+    // Update the quadruped's position.
+    quad->x = bodyPos[0];
+    quad->y = bodyPos[1];
+
+    // Compute orientation (yaw) from the rotation matrix.
+    // (Assuming that the forward direction is given by the first column of the rotation matrix.)
+    double yaw = atan2(bodyR[4], bodyR[0]);
+    quad->orientation = yaw;
+
+    // --- New Full-Circle Sensor Update ---
+    // Cast NUM_RAYS rays uniformly distributed in a circle around the quadruped.
+    for (int i = 0; i < NUM_RAYS; i++) {
+        // Compute the angle for this sensor relative to the quadruped's orientation.
+        double angle = quad->orientation + (2 * M_PI * i / NUM_RAYS);
+        // Set the sensor's starting position at the body position.
+        double sensorX = bodyPos[0];
+        double sensorY = bodyPos[1];
+        double sensorZ = bodyPos[2]; // Adjust if you want an offset (e.g., body height)
+
+        // Compute the direction of the ray.
+        double dirX = cos(angle);
+        double dirY = sin(angle);
+        double dirZ = 0.0; // Horizontal plane only
+
+        dGeomRaySet(quad->raySensors[i], sensorX, sensorY, sensorZ, dirX, dirY, dirZ);
+    }
+
+    // For each sensor ray, perform collision checks.
+    for (int idx = 0; idx < NUM_RAYS; idx++) {
+        double minReading = 1.0;
+        dContactGeom contact;
+        int n = dCollide(quad->raySensors[idx], groundPlaneGeom, 1, &contact, sizeof(dContactGeom));
+        if (n > 0) {
+            double reading = contact.depth / SENSOR_MAX_DIST;
+            if (reading < minReading)
+                minReading = reading;
+        }
+        // Check against obstacles.
+        for (int obs = 0; obs < totalObstaclesCreated; obs++) {
+            n = dCollide(quad->raySensors[idx], obstacles[obs], 1, &contact, sizeof(dContactGeom));
             if (n > 0) {
                 double reading = contact.depth / SENSOR_MAX_DIST;
                 if (reading < minReading)
                     minReading = reading;
             }
-            for (int obs = 0; obs < totalObstaclesCreated; obs++) {
-                n = dCollide(quad->raySensors[idx], obstacles[obs], 1, &contact, sizeof(dContactGeom));
-                if (n > 0) {
-                    double reading = contact.depth / SENSOR_MAX_DIST;
-                    if (reading < minReading)
-                        minReading = reading;
-                }
-            }
-            if (minReading > 1.0)
-                minReading = 1.0;
-            quad->sensorValues[idx] = minReading;
         }
+        // Now check against the wall geometries.
+        for (int w = 0; w < 4; w++) {
+            n = dCollide(quad->raySensors[idx], boundaryBoxes[w], 1, &contact, sizeof(dContactGeom));
+            if (n > 0) {
+                double reading = contact.depth / SENSOR_MAX_DIST;
+                if (reading < minReading)
+                    minReading = reading;
+            }
+        }
+        if (minReading > 1.0)
+            minReading = 1.0;
+        quad->sensorValues[idx] = minReading;
     }
-    
-    // Compute current target distance.
+
+    // --- Compute current target distance ---
     const dReal* targetPos = dBodyGetPosition(targetBall);
     double dx = targetPos[0] - bodyPos[0];
     double dy = targetPos[1] - bodyPos[1];
     double dz = targetPos[2] - bodyPos[2];
     double currentTargetDistance = sqrt(dx * dx + dy * dy + dz * dz);
     quad->distanceToTarget = currentTargetDistance;
-    
+
     double reward = 0.0;
-    
-    // Reward for advancing at least 3 units closer.
+    // Reward based on improvement in target distance.
     if ((quad->prevTargetDistance - currentTargetDistance) >= 3.0) {
         reward += 5000.0;
-    }
-    else if ((quad->prevTargetDistance - currentTargetDistance) >= 1.5) {
+    } else if ((quad->prevTargetDistance - currentTargetDistance) >= 1.5) {
         reward += 2500.0;
-    }
-    else if ((quad->prevTargetDistance - currentTargetDistance) >= 0.5) {
+    } else if ((quad->prevTargetDistance - currentTargetDistance) >= 0.5) {
         reward += 500.0;
-    }
-    else { 
+    } else {
         reward -= 500.0;
     }
     quad->prevTargetDistance = currentTargetDistance;
-    
-    // Reward for crossing an obstacle line.
+
+    // Reward for crossing obstacle lines.
     for (int i = 0; i < totalObstaclesCreated; i++) {
         const dReal* obsPos = dGeomGetPosition(obstacles[i]);
         double lineX = obsPos[0] + 0.5;
@@ -648,38 +686,36 @@ static void updateSensorsAndControl(Quadruped *quad)
     }
     quad->prevX = bodyPos[0];
     quad->prevY = bodyPos[1];
-    
+
     // Check collision penalty.
     if (quad->collisionPenalty < 0) {
         reward = -500.0;
         quad->collisionPenalty = 0.0;
     }
-    
+
     // Blinking feedback.
     if (quad->blinkCount == 0) {
         if (reward >= 0) {
             quad->blinkType = BLINK_GREEN;
             quad->blinkCount = 2;
             quad->blinkStartTime = simulationTime;
-        } else if (reward < 0) {
+        } else {
             quad->blinkType = BLINK_RED;
             quad->blinkCount = 2;
             quad->blinkStartTime = simulationTime;
         }
     }
-    
-    // Run neural network with the computed reward.
+
+    // Run the neural network with the computed reward and updated sensor inputs.
     double actions[ACTOR_OUTPUTS];
     runNeuralNetwork(quad, reward, actions);
-    
-    // Select the action with the highest output.
+
+    // Select and execute the action with the highest output.
     int state = 0;
     double maxVal = actions[0];
     for (int i = 1; i < ACTOR_OUTPUTS; i++) {
         if (actions[i] > maxVal) { maxVal = actions[i]; state = i; }
     }
-    
-    // Execute the chosen action.
     switch (state) {
         case 0:
             for (int i = 0; i < 4; i++) {
@@ -836,48 +872,44 @@ static void simLoop(int pause)
     const dReal* tPos = dBodyGetPosition(targetBall);
     dsDrawSphere(tPos, dBodyGetRotation(targetBall), 2.0);
     
+    // --- Updated Sensor Drawing Code (Full Circle with Gradient) ---
     glPushAttrib(GL_ENABLE_BIT);
     glDisable(GL_LIGHTING);
-    glLineWidth(1.0);
+    glLineWidth(1.25);
     glBegin(GL_LINES);
+    
+    // For each quadruped, draw its sensor rays in a full circle.
     for (int q = 0; q < NUM_QUADRUPEDS; q++) {
         Quadruped *quad = &wobjects.quads[q];
         if (!quad->body) continue;
         const dReal *bodyPos = dBodyGetPosition(quad->body);
-        const dReal *bodyR = dBodyGetRotation(quad->body);
-        dVector3 forward = { bodyR[0], bodyR[4], bodyR[8] };
-        dVector3 right = { bodyR[1], bodyR[5], bodyR[9] };
-        dVector3 up = { bodyR[2], bodyR[6], bodyR[10] };
-        for (int i = 0; i < SENSOR_RAY_GRID; i++) {
-            for (int j = 0; j < SENSOR_RAY_GRID; j++) {
-                int idx = i * SENSOR_RAY_GRID + j;
-                double horiz = (((double)j - (SENSOR_RAY_GRID - 1) / 2.0) * (SENSOR_CONE_ANGLE / (SENSOR_RAY_GRID - 1)));
-                double vert = (((double)i - (SENSOR_RAY_GRID - 1) / 2.0) * (SENSOR_CONE_ANGLE / (SENSOR_RAY_GRID - 1)));
-                double cosVert = cos(vert), sinVert = sin(vert);
-                double cosHoriz = cos(horiz), sinHoriz = sin(horiz);
-                dVector3 rayDir;
-                rayDir[0] = cosVert * cosHoriz * forward[0] + cosVert * sinHoriz * right[0] + sinVert * up[0];
-                rayDir[1] = cosVert * cosHoriz * forward[1] + cosVert * sinHoriz * right[1] + sinVert * up[1];
-                rayDir[2] = cosVert * cosHoriz * forward[2] + cosVert * sinHoriz * right[2] + sinVert * up[2];
-                double sensorX = bodyPos[0] + forward[0] * (BODY_LENGTH * 0.5);
-                double sensorY = bodyPos[1] + forward[1] * (BODY_LENGTH * 0.5);
-                double sensorZ = bodyPos[2];
-                double reading = quad->sensorValues[idx];
-                double drawLength = DRAWN_MAX_LENGTH * reading;
-                float r = (float)(1.0 - reading);
-                float b = (float)(reading);
-                float g = 0.2f;  
-                glColor3f(r, g, b);
-                glVertex3d(sensorX, sensorY, sensorZ);
-                glVertex3d(sensorX + rayDir[0] * drawLength,
-                           sensorY + rayDir[1] * drawLength,
-                           sensorZ + rayDir[2] * drawLength);
-            }
+        double baseAngle = quad->orientation; // Updated in updateSensorsAndControl.
+        for (int i = 0; i < NUM_RAYS; i++) {
+            // Compute the angle for this sensor.
+            double angle = baseAngle + (2 * M_PI * i / NUM_RAYS);
+            dVector3 sensorOrigin = { bodyPos[0], bodyPos[1], bodyPos[2] };
+            dVector3 sensorDir = { cos(angle), sin(angle), 0.0 };
+            
+            // The sensor's reading is in [0,1]. We map 0 -> red (hue=0) and 1 -> blue (hue=240).
+            double hue = quad->sensorValues[i] * 240.0;
+            float r, g, b;
+            hsv2rgb(hue, 1.0, 1.0, r, g, b);
+            
+            // Draw length is based on the sensor reading.
+            double drawLength = DRAWN_MAX_LENGTH * quad->sensorValues[i];
+            glColor3f(r, g, b);
+            
+            glVertex3d(sensorOrigin[0], sensorOrigin[1], sensorOrigin[2]);
+            glVertex3d(sensorOrigin[0] + sensorDir[0] * drawLength,
+                       sensorOrigin[1] + sensorDir[1] * drawLength,
+                       sensorOrigin[2] + sensorDir[2] * drawLength);
         }
     }
+    
     glEnd();
     glPopAttrib();
     
+    // --- Quadruped Drawing Code ---
     for (int i = 0; i < NUM_QUADRUPEDS; i++) {
         Quadruped *quad = &wobjects.quads[i];
         if (quad->body) {
@@ -886,7 +918,7 @@ static void simLoop(int pause)
             double elapsed = simulationTime - quad->blinkStartTime;
             if (quad->blinkCount > 0 && elapsed < quad->blinkCount * BLINK_PERIOD) {
                 if (fmod(elapsed, BLINK_PERIOD) < (BLINK_PERIOD / 2)) {
-                    switch(quad->blinkType) {
+                    switch (quad->blinkType) {
                         case BLINK_GREEN:
                             color[0] = 0.0f; color[1] = 1.0f; color[2] = 0.0f;
                             break;
