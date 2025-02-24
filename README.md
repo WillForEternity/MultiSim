@@ -1,12 +1,10 @@
-# MultiSim
+# MultiSim Development in progress...
 
 **MultiSim** is a simulation framework that integrates a physics-based engine with an actor–critic reinforcement learning algorithm to enable wheeled quadrupeds to learn navigation in dynamic obstacle courses. The project is implemented in C++ using the Open Dynamics Engine (ODE) for physics simulation and visualization, while the neural networks are built from scratch with an actor–critic architecture.
 
 ![MultiSim](Intro.png)
 
 ---
-
-# Development in progress...
 
 ## Overview
 
