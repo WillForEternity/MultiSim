@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
-#include <sstream>    // For ostringstream
+#include <sstream>    
 #include <string>
 
 // --- Hyperparameters ---
@@ -315,61 +315,104 @@ void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_O
     
     // --- (Optional) Export network parameters to CSV ---
     // Now using std::string for CSV serialization.
-    std::string csvData = serializeNetworkToCSV();
+    std::string csvData = serializeNetworkToCSV(
+    input,
+    actor_z1,
+    actor_h1,
+    actor_z2,
+    policy,
+    chosen_action,
+    entropy,
+    critic_z1,
+    critic_h1,
+    critic_value,
+    reward,
+    td_error,
+    advantage
+);
     writeCSVData("network_parameters.csv", csvData.c_str());
 }
 
 // --- CSV Serialization Function ---
-// Updated to use std::ostringstream and return a std::string.
-std::string serializeNetworkToCSV() {
+// This new function logs both network parameters and key runtime values.
+// You may need to call this function from runNeuralNetwork(), passing the computed values.
+std::string serializeNetworkToCSV(
+    const double input[NUM_INPUTS],
+    const double actor_z1[HIDDEN_SIZE],
+    const double actor_h1[HIDDEN_SIZE],
+    const double actor_z2[ACTOR_OUTPUTS],
+    const double policy[ACTOR_OUTPUTS],
+    int chosen_action,
+    double entropy,
+    const double critic_z1[HIDDEN_SIZE],
+    const double critic_h1[HIDDEN_SIZE],
+    double critic_value,
+    double reward,
+    double td_error,
+    double advantage)
+{
     std::ostringstream oss;
+    // CSV header with a new Category field for clarity.
+    oss << "Category,Layer,Index1,Index2,Value\n";
     
-    // CSV header
-    oss << "Layer,Index1,Index2,Value\n";
+    // Log Input Values.
+    for (int i = 0; i < NUM_INPUTS; i++) {
+         oss << "Input,,," << i << "," << input[i] << "\n";
+    }
     
-    // Serialize actor_W1
+    // Log Actor Network Intermediate Values.
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+         oss << "Actor_z1,Layer1," << i << ",," << actor_z1[i] << "\n";
+         oss << "Actor_h1,Layer1," << i << ",," << actor_h1[i] << "\n";
+    }
+    for (int k = 0; k < ACTOR_OUTPUTS; k++) {
+         oss << "Actor_z2,Layer2," << k << ",," << actor_z2[k] << "\n";
+         oss << "Policy,Layer2," << k << ",," << policy[k] << "\n";
+    }
+    oss << "Chosen_Action,Output,,," << chosen_action << "\n";
+    oss << "Entropy,Output,,," << entropy << "\n";
+    
+    // Log Critic Network Intermediate Values.
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+         oss << "Critic_z1,Layer1," << i << ",," << critic_z1[i] << "\n";
+         oss << "Critic_h1,Layer1," << i << ",," << critic_h1[i] << "\n";
+    }
+    oss << "Critic_Value,Output,,," << critic_value << "\n";
+    
+    // Log Learning Metrics.
+    oss << "Reward,,,," << reward << "\n";
+    oss << "TD_Error,,,," << td_error << "\n";
+    oss << "Advantage,,,," << advantage << "\n";
+    
+    // Log Actor Network Parameters.
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         for (int j = 0; j < NUM_INPUTS; j++) {
-            oss << "actor_W1," << i << "," << j << "," << actor_W1[i][j] << "\n";
+            oss << "actor_W1,Layer1," << i << "," << j << "," << actor_W1[i][j] << "\n";
         }
     }
-    
-    // Serialize actor_b1 (no second index)
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-        oss << "actor_b1," << i << ",," << actor_b1[i] << "\n";
+         oss << "actor_b1,Layer1," << i << ",," << actor_b1[i] << "\n";
+    }
+    for (int k = 0; k < ACTOR_OUTPUTS; k++) {
+         for (int i = 0; i < HIDDEN_SIZE; i++) {
+             oss << "actor_W2,Layer2," << k << "," << i << "," << actor_W2[k][i] << "\n";
+         }
+         oss << "actor_b2,Layer2," << k << ",," << actor_b2[k] << "\n";
     }
     
-    // Serialize actor_W2
-    for (int i = 0; i < ACTOR_OUTPUTS; i++) {
-        for (int j = 0; j < HIDDEN_SIZE; j++) {
-            oss << "actor_W2," << i << "," << j << "," << actor_W2[i][j] << "\n";
-        }
-    }
-    
-    // Serialize actor_b2
-    for (int i = 0; i < ACTOR_OUTPUTS; i++) {
-        oss << "actor_b2," << i << ",," << actor_b2[i] << "\n";
-    }
-    
-    // Serialize critic_W1
+    // Log Critic Network Parameters.
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-        for (int j = 0; j < NUM_INPUTS; j++) {
-            oss << "critic_W1," << i << "," << j << "," << critic_W1[i][j] << "\n";
-        }
+         for (int j = 0; j < NUM_INPUTS; j++) {
+             oss << "critic_W1,Layer1," << i << "," << j << "," << critic_W1[i][j] << "\n";
+         }
     }
-    
-    // Serialize critic_b1
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-        oss << "critic_b1," << i << ",," << critic_b1[i] << "\n";
+         oss << "critic_b1,Layer1," << i << ",," << critic_b1[i] << "\n";
     }
-    
-    // Serialize critic_W2
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-        oss << "critic_W2,0," << i << "," << critic_W2[0][i] << "\n";
+         oss << "critic_W2,Output,0," << i << "," << critic_W2[0][i] << "\n";
     }
-    
-    // Serialize critic_b2 (only one element)
-    oss << "critic_b2,0,," << critic_b2[0] << "\n";
+    oss << "critic_b2,Output,0,," << critic_b2[0] << "\n";
     
     return oss.str();
 }

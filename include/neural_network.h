@@ -40,7 +40,21 @@ void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_O
 
 // C++ only function declarations:
 #ifdef __cplusplus
-std::string serializeNetworkToCSV();
+std::string serializeNetworkToCSV(
+    const double input[NUM_INPUTS],
+    const double actor_z1[HIDDEN_SIZE],
+    const double actor_h1[HIDDEN_SIZE],
+    const double actor_z2[ACTOR_OUTPUTS],
+    const double policy[ACTOR_OUTPUTS],
+    int chosen_action,
+    double entropy,
+    const double critic_z1[HIDDEN_SIZE],
+    const double critic_h1[HIDDEN_SIZE],
+    double critic_value,
+    double reward,
+    double td_error,
+    double advantage
+);
 #endif
 
 #endif // NEURAL_NETWORK_H
