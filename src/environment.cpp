@@ -478,8 +478,8 @@ static void replaceQuadruped(int index)
     
     // Heavy penalty for replacement.
     double dummy[ACTOR_OUTPUTS];
-    runNeuralNetwork(quad, -100.0, dummy);
-    quad->fitness -= 200.0;
+    runNeuralNetwork(quad, -200.0, dummy);
+    quad->fitness -= 500.0;
     
     double margin = 2.0;
     double startX = -80.0 + margin;
@@ -511,20 +511,19 @@ static void nearCallback(void *data, dGeomID o1, dGeomID o2)
         dJointID c = dJointCreateContact(world, contactGroup, &contacts[i]);
         dJointAttach(c, dGeomGetBody(o1), dGeomGetBody(o2));
         
-        // *** Filter out ground collisions from triggering punishments ***
+        // Filter out ground collisions.
         if (o1 == groundPlaneGeom || o2 == groundPlaneGeom)
             continue;
-        
         void* data1 = dGeomGetData(o1);
         void* data2 = dGeomGetData(o2);
         
-        // --- Handle collisions with obstacles ---
+        // --- Handle collisions with obstacles (reduced penalty) ---
         if (data1 == (void*)"obstacle") {
             dBodyID b = dGeomGetBody(o2);
             if (b) {
                 Quadruped *quad = (Quadruped*)dBodyGetData(b);
                 if (quad)
-                    quad->collisionPenalty -= 5.0;
+                    quad->collisionPenalty -= 20.0;
             }
         }
         else if (data2 == (void*)"obstacle") {
@@ -532,7 +531,7 @@ static void nearCallback(void *data, dGeomID o1, dGeomID o2)
             if (b) {
                 Quadruped *quad = (Quadruped*)dBodyGetData(b);
                 if (quad)
-                    quad->collisionPenalty -= 5.0;
+                    quad->collisionPenalty -= 20.0;
             }
         }
         
@@ -570,7 +569,7 @@ static void nearCallback(void *data, dGeomID o1, dGeomID o2)
             if (b) {
                 Quadruped *quad = (Quadruped*)dBodyGetData(b);
                 if (quad)
-                    quad->collisionPenalty -= 5.0;
+                    quad->collisionPenalty -= 10.0;
             }
         }
     }
@@ -600,29 +599,22 @@ static void updateSensorsAndControl(Quadruped *quad)
     quad->y = bodyPos[1];
 
     // Compute orientation (yaw) from the rotation matrix.
-    // (Assuming that the forward direction is given by the first column of the rotation matrix.)
     double yaw = atan2(bodyR[4], bodyR[0]);
     quad->orientation = yaw;
 
-    // --- New Full-Circle Sensor Update ---
-    // Cast NUM_RAYS rays uniformly distributed in a circle around the quadruped.
+    // Update sensor rays (full circle) 
     for (int i = 0; i < NUM_RAYS; i++) {
-        // Compute the angle for this sensor relative to the quadruped's orientation.
         double angle = quad->orientation + (2 * M_PI * i / NUM_RAYS);
-        // Set the sensor's starting position at the body position.
         double sensorX = bodyPos[0];
         double sensorY = bodyPos[1];
-        double sensorZ = bodyPos[2]; // Adjust if you want an offset (e.g., body height)
-
-        // Compute the direction of the ray.
+        double sensorZ = bodyPos[2];
         double dirX = cos(angle);
         double dirY = sin(angle);
-        double dirZ = 0.0; // Horizontal plane only
-
+        double dirZ = 0.0;
         dGeomRaySet(quad->raySensors[i], sensorX, sensorY, sensorZ, dirX, dirY, dirZ);
     }
 
-    // For each sensor ray, perform collision checks.
+    // Sensor collision checks
     for (int idx = 0; idx < NUM_RAYS; idx++) {
         double minReading = 1.0;
         dContactGeom contact;
@@ -641,7 +633,7 @@ static void updateSensorsAndControl(Quadruped *quad)
                     minReading = reading;
             }
         }
-        // Now check against the wall geometries.
+        // Check against wall geometries.
         for (int w = 0; w < 4; w++) {
             n = dCollide(quad->raySensors[idx], boundaryBoxes[w], 1, &contact, sizeof(dContactGeom));
             if (n > 0) {
@@ -655,7 +647,7 @@ static void updateSensorsAndControl(Quadruped *quad)
         quad->sensorValues[idx] = minReading;
     }
 
-    // --- Compute current target distance ---
+    // Compute current target distance 
     const dReal* targetPos = dBodyGetPosition(targetBall);
     double dx = targetPos[0] - bodyPos[0];
     double dy = targetPos[1] - bodyPos[1];
@@ -663,54 +655,48 @@ static void updateSensorsAndControl(Quadruped *quad)
     double currentTargetDistance = sqrt(dx * dx + dy * dy + dz * dz);
     quad->distanceToTarget = currentTargetDistance;
 
-    double reward = 0.0;
-    // Reward based on improvement in target distance.
-    if ((quad->prevTargetDistance - currentTargetDistance) >= 3.0) {
-        reward += 5000.0;
-    } else if ((quad->prevTargetDistance - currentTargetDistance) >= 1.5) {
-        reward += 2500.0;
-    } else if ((quad->prevTargetDistance - currentTargetDistance) >= 0.5) {
-        reward += 500.0;
-    } else {
-        reward -= 500.0;
-    }
+    // Continuous reward based on target distance improvement
+    double distanceImprovement = quad->prevTargetDistance - currentTargetDistance;
+    // Positive reward if getting closer, negative otherwise.
+    double reward = 10.0 * distanceImprovement + 20.0;  
     quad->prevTargetDistance = currentTargetDistance;
 
-    // Reward for crossing obstacle lines.
+    // Reward for crossing obstacle lines
     for (int i = 0; i < totalObstaclesCreated; i++) {
         const dReal* obsPos = dGeomGetPosition(obstacles[i]);
         double lineX = obsPos[0] + 0.5;
         if ((quad->prevX < lineX && bodyPos[0] >= lineX) ||
             (quad->prevX > lineX && bodyPos[0] <= lineX))
-            reward += 500.0;
+            reward += 20.0;  // Smaller bonus than before.
     }
     quad->prevX = bodyPos[0];
     quad->prevY = bodyPos[1];
 
-    // Check collision penalty.
-    if (quad->collisionPenalty < 0) {
-        reward = -500.0;
-        quad->collisionPenalty = 0.0;
-    }
+    // Incorporate collision penalty (add rather than overwrite) 
+    reward += quad->collisionPenalty;
+    quad->collisionPenalty = 0.0;
 
-    // Blinking feedback.
+    // Blinking feedback (unchanged) 
     if (quad->blinkCount == 0) {
-        if (reward >= 0) {
+        if (reward >= 10) {
             quad->blinkType = BLINK_GREEN;
-            quad->blinkCount = 2;
+            quad->blinkCount = 1;
             quad->blinkStartTime = simulationTime;
-        } else {
+        } else if (reward <= -10) {
             quad->blinkType = BLINK_RED;
-            quad->blinkCount = 2;
+            quad->blinkCount = 1;
             quad->blinkStartTime = simulationTime;
+        }
+        else {
+            quad->blinkType = BLINK_NONE;
         }
     }
 
-    // Run the neural network with the computed reward and updated sensor inputs.
+    // Run the neural network with the computed reward
     double actions[ACTOR_OUTPUTS];
     runNeuralNetwork(quad, reward, actions);
 
-    // Select and execute the action with the highest output.
+    // Select and execute the action with the highest output 
     int state = 0;
     double maxVal = actions[0];
     for (int i = 1; i < ACTOR_OUTPUTS; i++) {
@@ -757,67 +743,25 @@ static void simLoop(int pause)
             updateSensorsAndControl(quad);
             const dReal *pos = dBodyGetPosition(quad->body);
             quad->fitness = pos[0];
+            // If the quadruped has fallen, apply a reduced penalty.
             if (hasFallen(quad)) {
                 double dummy[ACTOR_OUTPUTS];
-                runNeuralNetwork(quad, -100.0, dummy);
+                runNeuralNetwork(quad, -500.0, dummy);  // Reduced falling penalty.
                 replaceQuadruped(i);
                 continue;
             }
             const dReal *bodyR = dBodyGetRotation(quad->body);
             dVector3 forward = { bodyR[0], bodyR[4], bodyR[8] };
+            // If the forward vector is below threshold, apply a reduced side-wall penalty.
             if (fabs(forward[0]) < SIDE_WALL_THRESHOLD) {
                 double dummy[ACTOR_OUTPUTS];
-                runNeuralNetwork(quad, -100.0, dummy);
+                runNeuralNetwork(quad, -50.0, dummy);  // Reduced side-wall penalty.
                 replaceQuadruped(i);
                 continue;
             }
         }
         
-        // Reshuffle logic.
-        bool reshuffleTriggered = false;
-        for (int i = 0; i < NUM_QUADRUPEDS; i++) {
-            Quadruped *quad = &wobjects.quads[i];
-            if (quad->respawnCount >= RESHUFFLE_RESPAWN_THRESHOLD &&
-                (simulationTime - quad->lastRespawnTime) < RESHUFFLE_TIME_WINDOW) {
-                reshuffleTriggered = true;
-                break;
-            }
-        }
-        if (reshuffleTriggered) {
-            for (int i = 0; i < NUM_QUADRUPEDS; i++) {
-                Quadruped *quad = &wobjects.quads[i];
-                if (quad->body) { dBodyDestroy(quad->body); quad->body = 0; }
-                if (quad->bodyGeom) { dGeomDestroy(quad->bodyGeom); quad->bodyGeom = 0; }
-                for (int j = 0; j < 4; j++) {
-                    if (quad->leg[j]) { dBodyDestroy(quad->leg[j]); quad->leg[j] = 0; }
-                    if (quad->legGeom[j]) { dGeomDestroy(quad->legGeom[j]); quad->legGeom[j] = 0; }
-                    if (quad->hip[j]) { dJointDestroy(quad->hip[j]); quad->hip[j] = 0; }
-                    if (quad->wheelJoint[j]) { dJointDestroy(quad->wheelJoint[j]); quad->wheelJoint[j] = 0; }
-                    if (quad->wheel[j]) { dBodyDestroy(quad->wheel[j]); quad->wheel[j] = 0; }
-                    if (quad->wheelTransform[j]) { dGeomDestroy(quad->wheelTransform[j]); quad->wheelTransform[j] = 0; }
-                }
-                for (int k = 0; k < NUM_RAYS; k++) {
-                    if (quad->raySensors[k]) { dGeomDestroy(quad->raySensors[k]); quad->raySensors[k] = 0; }
-                }
-                quad->respawnCount = 0;
-                quad->lastRespawnTime = simulationTime;
-                quad->blinkCount = 4;
-                quad->blinkStartTime = simulationTime;
-            }
-            initNetwork();
-            double margin = 2.0;
-            double startX = -60.0 + margin;
-            double startY = -25.0 + margin;
-            double endY = 25.0 - margin;
-            double spacing = (NUM_QUADRUPEDS > 1) ? (endY - startY) / (NUM_QUADRUPEDS - 1) : 0;
-            for (int i = 0; i < NUM_QUADRUPEDS; i++) {
-                double x = startX;
-                double y = startY + i * spacing;
-                createQuadruped(&wobjects.quads[i], x, y);
-            }
-        }
-        
-        // Global weight-change blink.
+        // Global weight-change blink 
         if (globalWeightChangeBlink > 0) {
             for (int i = 0; i < NUM_QUADRUPEDS; i++) {
                 wobjects.quads[i].blinkType = BLINK_BLUE;
@@ -872,7 +816,7 @@ static void simLoop(int pause)
     const dReal* tPos = dBodyGetPosition(targetBall);
     dsDrawSphere(tPos, dBodyGetRotation(targetBall), 2.0);
     
-    // --- Updated Sensor Drawing Code (Full Circle with Gradient) ---
+    //  Updated Sensor Drawing Code (Full Circle with Gradient) 
     glPushAttrib(GL_ENABLE_BIT);
     glDisable(GL_LIGHTING);
     glLineWidth(1.25);
@@ -909,7 +853,7 @@ static void simLoop(int pause)
     glEnd();
     glPopAttrib();
     
-    // --- Quadruped Drawing Code ---
+    // Quadruped Drawing Code 
     for (int i = 0; i < NUM_QUADRUPEDS; i++) {
         Quadruped *quad = &wobjects.quads[i];
         if (quad->body) {

@@ -1,16 +1,21 @@
+// neural_network.cpp
 #include "../include/neural_network.h"
 #include "../include/common.h"
 #include "../include/quadruped.h"
+#include "../include/socket.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <string.h>
+#include <sstream>    // For ostringstream
+#include <string>
 
 // --- Hyperparameters ---
-const double ACTOR_LR = 0.05;
-const double CRITIC_LR = 0.05;
+const double ACTOR_LR = 0.005;
+const double CRITIC_LR = 0.005;
 const double GAMMA = 0.9;
-const double ALPHA_ENTROPY = 0.05;
+const double ALPHA_ENTROPY = 0.005;
 const double POLYAK = 0.05;
 
 // --- Adam parameters ---
@@ -123,7 +128,8 @@ static void polyakUpdate() {
 static void softmax(const double *z, int n, double *p) {
     double max_z = z[0];
     for (int i = 1; i < n; i++) {
-        if (z[i] > max_z) max_z = z[i];
+        if (z[i] > max_z)
+            max_z = z[i];
     }
     double sum = 0.0;
     for (int i = 0; i < n; i++) {
@@ -232,7 +238,6 @@ void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_O
             break;
         }
     }
-
     for (int i = 0; i < ACTOR_OUTPUTS; i++) {
         out_actions[i] = policy[i];
     }
@@ -305,6 +310,66 @@ void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_O
     polyakUpdate();
     
     // --- Global weight change blink trigger ---
-    if (fabs(td_error) > 100000.0)
+    if (fabs(td_error) > 2000.0)
         globalWeightChangeBlink = 1.0;
+    
+    // --- (Optional) Export network parameters to CSV ---
+    // Now using std::string for CSV serialization.
+    std::string csvData = serializeNetworkToCSV();
+    writeCSVData("network_parameters.csv", csvData.c_str());
+}
+
+// --- CSV Serialization Function ---
+// Updated to use std::ostringstream and return a std::string.
+std::string serializeNetworkToCSV() {
+    std::ostringstream oss;
+    
+    // CSV header
+    oss << "Layer,Index1,Index2,Value\n";
+    
+    // Serialize actor_W1
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        for (int j = 0; j < NUM_INPUTS; j++) {
+            oss << "actor_W1," << i << "," << j << "," << actor_W1[i][j] << "\n";
+        }
+    }
+    
+    // Serialize actor_b1 (no second index)
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        oss << "actor_b1," << i << ",," << actor_b1[i] << "\n";
+    }
+    
+    // Serialize actor_W2
+    for (int i = 0; i < ACTOR_OUTPUTS; i++) {
+        for (int j = 0; j < HIDDEN_SIZE; j++) {
+            oss << "actor_W2," << i << "," << j << "," << actor_W2[i][j] << "\n";
+        }
+    }
+    
+    // Serialize actor_b2
+    for (int i = 0; i < ACTOR_OUTPUTS; i++) {
+        oss << "actor_b2," << i << ",," << actor_b2[i] << "\n";
+    }
+    
+    // Serialize critic_W1
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        for (int j = 0; j < NUM_INPUTS; j++) {
+            oss << "critic_W1," << i << "," << j << "," << critic_W1[i][j] << "\n";
+        }
+    }
+    
+    // Serialize critic_b1
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        oss << "critic_b1," << i << ",," << critic_b1[i] << "\n";
+    }
+    
+    // Serialize critic_W2
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        oss << "critic_W2,0," << i << "," << critic_W2[0][i] << "\n";
+    }
+    
+    // Serialize critic_b2 (only one element)
+    oss << "critic_b2,0,," << critic_b2[0] << "\n";
+    
+    return oss.str();
 }

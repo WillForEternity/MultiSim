@@ -1,7 +1,8 @@
-CXX = g++-14
-CXXFLAGS = -stdlib=libc++ -I/usr/local/include -fopenmp -O2 -Wall
-LDFLAGS = -L/usr/local/lib -lode -ldrawstuff -lm -framework GLUT -framework OpenGL
-SRC = src/environment.cpp src/neural_network.cpp
+CXX = clang++
+CXXFLAGS = -stdlib=libc++ -I/usr/local/include -O2 -Wall
+LDFLAGS = -stdlib=libc++ -L/usr/local/lib -lode -ldrawstuff -lm -framework GLUT -framework OpenGL
+
+SRC = src/environment.cpp src/neural_network.cpp src/socket.cpp
 TARGET = multiSim2
 
 all: $(TARGET)
