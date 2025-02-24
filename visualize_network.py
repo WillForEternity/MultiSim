@@ -33,7 +33,7 @@ def read_csv_data(filename):
     For singular categories (with no indices), stores the value directly.
     """
     data = {}
-    # List of all known categories from your serializer:
+    # List of all known categories from serializer:
     categories = ["Input", "Actor_z1", "Actor_h1", "Actor_z2", "Policy",
                   "Chosen_Action", "Entropy",
                   "Critic_z1", "Critic_h1", "Critic_Value",
