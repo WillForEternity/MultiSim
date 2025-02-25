@@ -71,11 +71,6 @@ sleep 2
 
 # Launch the Python visualization script
 python3 visualize_network.py
-
-echo "Visualization script finished. Terminating simulation..."
-
-# Kill the simulation process when the visualization script is closed
-kill $SIM_PID
 ```
 You can run with:
 ```bash
