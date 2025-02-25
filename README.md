@@ -37,9 +37,49 @@ Ensure you have:
 - OpenGL and GLUT for graphics
 
 3. **Compile and Run**
-You can compile using the provided Makefile or directly with:
+You can compile using the provided Makefile:
+```Makefile
+CXX = clang++
+CXXFLAGS = -stdlib=libc++ -I/usr/local/include -O2 -Wall
+LDFLAGS = -stdlib=libc++ -L/usr/local/lib -lode -ldrawstuff -lm -framework GLUT -framework OpenGL
+
+SRC = src/environment.cpp src/neural_network.cpp src/socket.cpp
+TARGET = multiSim2
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
+
+clean:
+	rm -f $(TARGET)
+```
+With: 
 ```bash
-g++-14 -stdlib=libc++ -I/usr/local/include -L/usr/local/lib -o multiSim2 environment.cpp neural_network.cpp main.cpp -lode -ldrawstuff -lm -framework GLUT -framework OpenGL -fopenmp
+make
+```
+and then using the `run_all.sh` shell script:
+```Shell
+# Start the simulation in the background
+./multiSim2 &
+SIM_PID=$!
+
+echo "Started simulation (PID $SIM_PID)"
+
+# Wait a few seconds for the simulation to initialize and create CSV data
+sleep 2
+
+# Launch the Python visualization script
+python3 visualize_network.py
+
+echo "Visualization script finished. Terminating simulation..."
+
+# Kill the simulation process when the visualization script is closed
+kill $SIM_PID
+```
+You can run with:
+```bash
+./run_all.sh
 ```
 This compile command worked for me (m3 Macbook Air) but some fiddling may be needed. Adjust the include and library paths if necessary. To run the simulation, execute the compiled binary, of course:
 ```bash
