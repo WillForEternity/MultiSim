@@ -1,990 +1,566 @@
 // environment.cpp
-
-// compile: g++-14 -stdlib=libc++ -I/usr/local/include -L/usr/local/lib -o multiSim2 src/environment.cpp src/neural_network.cpp -lode -ldrawstuff -lm -framework GLUT -framework OpenGL -fopenmp
+// Main simulation environment using ODE physics and A2C reinforcement learning.
 
 #define GL_SILENCE_DEPRECATION
 
-#include "../include/environment.h"
-#include "../include/neural_network.h"
-#include "../include/common.h"
-#include "../include/quadruped.h"
-#include <ode/ode.h>
-#include <drawstuff/drawstuff.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-#include <time.h>
-#include <GLUT/glut.h>
+#ifdef __APPLE__
+#include <OpenGL/gl.h>
+#else
+#include <GL/gl.h>
+#endif
 
-// --- Visual behavior feedback ---
-#define BLINK_NONE  0
-#define BLINK_BLUE  1   // for considerable weight change
-#define BLINK_GREEN 2   // for reward
-#define BLINK_RED   3   // for punishment
+#include "environment.h"
+#include "neural_network.h"
+#include "physics.h"
+#include "rendering.h"
+#include "config.h"
 
-#define ACTOR_OUTPUTS 4
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <ctime>
 
-// External neural network functions.
-extern "C" {
-    // Defined in neural_network.cpp.
-    // void initNetwork();
-    // void runNeuralNetwork(struct Quadruped* quad, double reward, double out_actions[ACTOR_OUTPUTS]);
-    extern double globalWeightChangeBlink;
-    extern bool globalInitNetworkCalled;
-}
+// Static instance pointer for callbacks
+Environment* Environment::instance_ = nullptr;
 
-// Simulation and geometry settings.
-#define NUM_QUADRUPEDS    50
-#define SIMULATION_DT     0.015
+// External neural network state
+extern double globalWeightChangeBlink;
+extern bool globalInitNetworkCalled;
 
-// Sensor parameters.
-#define SENSOR_MAX_DIST   3.0
-#define SENSOR_CONE_ANGLE (M_PI/6.0)
-#define DRAWN_MAX_LENGTH  3.0
-
-// Body and leg parameters.
-#define BODY_LENGTH       0.4
-#define BODY_WIDTH        0.15
-#define BODY_HEIGHT       0.05
-#define BODY_MASS         10.0
-
-// Leg parameters.
-#define LEG_WIDTH         0.05
-#define LEG_LENGTH        0.3
-#define LEG_MASS          8.0
-
-// Wheel parameters.
-#define WHEEL_RADIUS      0.1
-#define WHEEL_WIDTH       0.1
-#define WHEEL_MASS        8.0
-
-#define HIP_FMAX          1000.0
-#define WHEEL_FMAX        1000.0
-#define MAX_OBSTACLES     10000
-
-// Behavior parameters.
-#define STAGNATION_TIME    20000.0
-#define SIDE_WALL_THRESHOLD 0.3
-
-// Reshuffle condition.
-#define RESHUFFLE_RESPAWN_THRESHOLD 4  
-#define RESHUFFLE_TIME_WINDOW       60.0  
-
-// Blink parameters.
-#define BLINK_PERIOD 0.2
-
-/******************************************************************************
- * Data Structures
- ******************************************************************************/
-typedef struct {
-    Quadruped quads[NUM_QUADRUPEDS];
-} WorldObjects;
-
-static WorldObjects wobjects;
-
-/******************************************************************************
- * ODE/Drawstuff Globals
- ******************************************************************************/
-static dWorldID      world;
-static dSpaceID      space;
-static dJointGroupID contactGroup;
-static dGeomID       groundPlaneGeom;
-static dGeomID       boundaryBoxes[4];
-
-enum WallType { SPAWN_WALL, SIDE_WALL, FAR_WALL };
-
-static double simulationTime = 0.0;
-static dGeomID obstacles[MAX_OBSTACLES];
-static dVector3 obstacleSizes[MAX_OBSTACLES];
-static int totalObstaclesCreated = 0;
-
-static dBodyID targetBall;
-static dGeomID targetBallGeom;
-
-/******************************************************************************
- * Forward declarations.
- ******************************************************************************/
-static void simLoop(int pause);
-static void start(void);
-static void command(int cmd);
-static void stop(void);
-static double getEnvironmentHeight(double x, double y);
-static void replaceQuadruped(int index);
-static double randomUniform(double min, double max);
-static void updateSensorsAndControl(Quadruped *quad);
-static void createQuadruped(Quadruped *quad, double x, double y);
-static void safeNormalizeBodyRotation(dBodyID body);
-static void drawText(const char* text, float x, float y);
-static void drawObstacleLines(void);
-
-/******************************************************************************
- * Helper: Check if rotation matrix is invalid.
- ******************************************************************************/
-static bool isBadRotation(const dMatrix3 R) {
-    double norm = sqrt(R[0]*R[0] + R[4]*R[4] + R[8]*R[8]);
-    return (norm < 1e-3 || norm > 1e3);
-}
-
-/******************************************************************************
- * safeNormalizeBodyRotation: Replace invalid rotation with identity.
- ******************************************************************************/
-static void safeNormalizeBodyRotation(dBodyID body) {
-    const dReal *R = dBodyGetRotation(body);
-    if (isBadRotation(R)) {
-        dMatrix3 identity;
-        dRSetIdentity(identity);
-        dBodySetRotation(body, identity);
-    }
-}
-
-/******************************************************************************
- * drawText: Draw 2D text.
- ******************************************************************************/
-static void drawText(const char* text, float x, float y)
-{
-    glMatrixMode(GL_PROJECTION);
-    glPushMatrix();
-    glLoadIdentity();
-    gluOrtho2D(0, 640, 0, 480);
-    glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
-    glLoadIdentity();
-    glRasterPos2f(x, y);
-    for (const char* c = text; *c != '\0'; c++) {
-        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, *c);
-    }
-    glPopMatrix();
-    glMatrixMode(GL_PROJECTION);
-    glPopMatrix();
-    glMatrixMode(GL_MODELVIEW);
-}
-
-/******************************************************************************
- * drawObstacleLines: Draw green lines on the ground for obstacle avoidance.
- ******************************************************************************/
-static void drawObstacleLines(void)
-{
-    glDisable(GL_LIGHTING);
-    glLineWidth(8.0);
-    glColor3f(0.0, 1.0, 0.0);
-    glBegin(GL_LINES);
-    for (int i = 0; i < totalObstaclesCreated; i++) {
-        const dReal* pos = dGeomGetPosition(obstacles[i]);
-        double sy = obstacleSizes[i][1] / 2.0;
-        double x = pos[0] + 0.5;
-        double y1 = pos[1] - sy - 2.0;
-        double y2 = pos[1] + sy + 2.0;
-        glVertex3f(x, y1, 0.0);
-        glVertex3f(x, y2, 0.0);
-    }
-    glEnd();
-    glEnable(GL_LIGHTING);
-}
-
-/******************************************************************************
- * createBox: Create a box body.
- ******************************************************************************/
-static dBodyID createBox(dReal length, dReal width, dReal height, dReal massValue, dGeomID *geomOut)
-{
-    dMass m;
-    dBodyID body = dBodyCreate(world);
-    dMassSetBoxTotal(&m, massValue, length, width, height);
-    dBodySetMass(body, &m);
-    dGeomID geom = dCreateBox(space, length, width, height);
-    dGeomSetBody(geom, body);
-    if (geomOut)
-        *geomOut = geom;
-    return body;
-}
-
-/******************************************************************************
- * createCylinder: Create a cylinder body.
- ******************************************************************************/
-static dBodyID createCylinder(dReal radius, dReal length, dReal massValue, bool isWheel, dGeomID *wheelTransformOut)
-{
-    dMass m;
-    dBodyID body = dBodyCreate(world);
-    dMassSetCylinderTotal(&m, massValue, 3, radius, length);
-    dBodySetMass(body, &m);
-    if (isWheel) {
-        dGeomID cylinderGeom = dCreateCylinder(0, radius, length);
-        dGeomID transGeom = dCreateGeomTransform(space);
-        dGeomTransformSetGeom(transGeom, cylinderGeom);
-        dGeomSetBody(transGeom, body);
-        dMatrix3 R;
-        dRFromAxisAndAngle(R, 1, 0, 0, M_PI/2);
-        dGeomSetRotation(transGeom, R);
-        if (wheelTransformOut)
-            *wheelTransformOut = transGeom;
-    } else {
-        dGeomID geom = dCreateCylinder(space, radius, length);
-        dGeomSetBody(geom, body);
-    }
-    return body;
-}
-
-/******************************************************************************
- * createQuadruped: Create a quadruped.
- ******************************************************************************/
-static void createQuadruped(Quadruped *quad, double x, double y)
-{
-    double anchorX[4], anchorY[4];
+Environment::Environment() 
+    : world_(nullptr)
+    , space_(nullptr)
+    , contactGroup_(nullptr)
+    , groundPlane_(nullptr)
+    , targetBall_(nullptr)
+    , targetBallGeom_(nullptr)
+    , numObstacles_(0)
+    , numQuadrupeds_(0)
+    , simulationTime_(0.0) {
+    
     for (int i = 0; i < 4; i++) {
-        double signX = (i < 2) ? -1.0 : 1.0;
-        double signY = ((i % 2)==0) ? -1.0 : 1.0;
-        anchorX[i] = x + signX*(BODY_LENGTH*0.5);
-        anchorY[i] = y + signY*(BODY_WIDTH*0.5);
+        boundaryBoxes_[i] = nullptr;
     }
-    double baseHeight = 0.0;
-    for (int i = 0; i < totalObstaclesCreated; i++) {
-        const dReal* pos = dGeomGetPosition(obstacles[i]);
-        double sx = obstacleSizes[i][0];
-        double sy = obstacleSizes[i][1];
-        double half_sx = sx/2.0;
-        double half_sy = sy/2.0;
-        if (x >= pos[0]-half_sx && x <= pos[0]+half_sx &&
-            y >= pos[1]-half_sy && y <= pos[1]+half_sy) {
-            double top = pos[2] + (obstacleSizes[i][2]/2.0);
-            if (top > baseHeight)
-                baseHeight = top;
-        }
-    }
-    double hipZ = baseHeight + LEG_LENGTH + 0.1;
-    double torsoZ = hipZ + (BODY_HEIGHT*0.5);
-    
-    quad->body = createBox(BODY_LENGTH, BODY_WIDTH, BODY_HEIGHT, BODY_MASS, &quad->bodyGeom);
-    dBodySetPosition(quad->body, x, y, torsoZ);
-    dBodySetData(quad->body, quad);
-    quad->fitness = x;
-    
-    quad->spawnX = x;
-    quad->spawnTime = simulationTime;
-    quad->prevX = x;
-    quad->prevY = y;
-    quad->lastMoveTime = simulationTime;
-    quad->stagnancyPunished = false;
-    quad->respawnCount = 0;
-    quad->lastRespawnTime = simulationTime;
-    quad->blinkType = BLINK_NONE;
-    quad->blinkCount = 0;
-    quad->blinkStartTime = 0.0;
-    quad->collisionPenalty = 0.0;
-    
-    const dReal* tPos = dBodyGetPosition(targetBall);
-    double dx = tPos[0]-x;
-    double dy = tPos[1]-y;
-    double dz = tPos[2]-torsoZ;
-    double dist = sqrt(dx*dx+dy*dy+dz*dz);
-    quad->distanceToTarget = dist;
-    quad->prevTargetDistance = dist;
-    quad->prevCriticValue = 0.0;
-    
-    for (int i = 0; i < NUM_RAYS; i++) {
-        quad->raySensors[i] = dCreateRay(space, SENSOR_MAX_DIST);
-        dGeomRaySet(quad->raySensors[i], x, y, torsoZ, 1, 0, 0);
-        quad->sensorValues[i] = 1.0;
-    }
-    
-    for (int i = 0; i < 4; i++){
-        quad->leg[i] = createBox(LEG_WIDTH, LEG_WIDTH, LEG_LENGTH, LEG_MASS, &quad->legGeom[i]);
-        dBodySetPosition(quad->leg[i], anchorX[i], anchorY[i], hipZ - LEG_LENGTH*0.5);
-        dBodySetData(quad->leg[i], quad);
-        
-        quad->hip[i] = dJointCreateHinge(world, 0);
-        dJointAttach(quad->hip[i], quad->body, quad->leg[i]);
-        dJointSetHingeAnchor(quad->hip[i], anchorX[i], anchorY[i], hipZ);
-        dJointSetHingeAxis(quad->hip[i], 0, 1, 0);
-        dJointSetHingeParam(quad->hip[i], dParamFMax, HIP_FMAX);
-        dJointSetHingeParam(quad->hip[i], dParamERP, 0.8);
-        dJointSetHingeParam(quad->hip[i], dParamCFM, 1e-5);
-        if (i < 2) {
-            dJointSetHingeParam(quad->hip[i], dParamLoStop, -1.0);
-            dJointSetHingeParam(quad->hip[i], dParamHiStop, -1.0);
-        } else {
-            dJointSetHingeParam(quad->hip[i], dParamLoStop, 1.0);
-            dJointSetHingeParam(quad->hip[i], dParamHiStop, 1.0);
-        }
-        
-        quad->wheel[i] = createCylinder(WHEEL_RADIUS, WHEEL_WIDTH, WHEEL_MASS, true, &quad->wheelTransform[i]);
-        double offsetY = ((i % 2)==0) ? -(LEG_WIDTH/2.0+WHEEL_RADIUS) : (LEG_WIDTH/2.0+WHEEL_RADIUS);
-        dBodySetPosition(quad->wheel[i], anchorX[i], anchorY[i]+offsetY, hipZ - LEG_LENGTH);
-        dBodySetData(quad->wheel[i], quad);
-        
-        quad->wheelJoint[i] = dJointCreateHinge(world, 0);
-        dJointAttach(quad->wheelJoint[i], quad->leg[i], quad->wheel[i]);
-        dJointSetHingeAnchor(quad->wheelJoint[i], anchorX[i], anchorY[i]+offsetY, hipZ - LEG_LENGTH);
-        dJointSetHingeAxis(quad->wheelJoint[i], 0, 1, 0);
-        dJointSetHingeParam(quad->wheelJoint[i], dParamLoStop, -dInfinity);
-        dJointSetHingeParam(quad->wheelJoint[i], dParamHiStop, dInfinity);
-        dJointSetHingeParam(quad->wheelJoint[i], dParamFMax, WHEEL_FMAX);
-        dJointSetHingeParam(quad->wheelJoint[i], dParamERP, 80);
-        dJointSetHingeParam(quad->wheelJoint[i], dParamCFM, 1e-4);
-    }
+    instance_ = this;
 }
 
-/******************************************************************************
- * createStaticObstacles: Create obstacles and boundaries.
- ******************************************************************************/
-void createStaticObstacles(int totalObstacles, double innerMargin, double outerMargin)
-{
-    totalObstaclesCreated = 0;
-    for (int i = 0; i < totalObstacles; i++) {
-        double x = -60.0 + innerMargin + ((double)rand()/RAND_MAX) * ((60.0 - outerMargin) - (-60.0 + innerMargin));
-        double y = -70.0 + innerMargin + ((double)rand()/RAND_MAX) * ((70.0 - outerMargin) - (-70.0 + innerMargin));
-        double sx = 0.5 + ((double)rand()/RAND_MAX) * 1.0;
-        double sy = 0.5 + ((double)rand()/RAND_MAX) * 1.0;
-        double sz = 0.1 + ((double)rand()/RAND_MAX) * (2.0 - 0.1);
+Environment::~Environment() {
+    cleanup();
+}
+
+void Environment::initialize() {
+    physics::initWorld(world_, space_, contactGroup_, groundPlane_);
+    physics::createBoundaryWalls(space_, boundaryBoxes_);
+    physics::createTargetBall(world_, space_, targetBall_, targetBallGeom_);
+}
+
+void Environment::createObstacles(int count) {
+    using namespace config;
+    
+    numObstacles_ = 0;
+    double innerMargin = 1.0;
+    double outerMargin = 1.0;
+    
+    for (int i = 0; i < count && numObstacles_ < MAX_OBSTACLES; i++) {
+        double x = -60.0 + innerMargin + (static_cast<double>(rand()) / RAND_MAX) * 
+                   ((60.0 - outerMargin) - (-60.0 + innerMargin));
+        double y = WORLD_Y_MIN + innerMargin + (static_cast<double>(rand()) / RAND_MAX) * 
+                   ((WORLD_Y_MAX - outerMargin) - (WORLD_Y_MIN + innerMargin));
+        
+        double sx = 0.5 + (static_cast<double>(rand()) / RAND_MAX) * 1.0;
+        double sy = 0.5 + (static_cast<double>(rand()) / RAND_MAX) * 1.0;
+        double sz = 0.1 + (static_cast<double>(rand()) / RAND_MAX) * (2.0 - 0.1);
         double pz = sz / 2.0;
         
-        dGeomID geom = dCreateBox(space, sx, sy, sz);
+        dGeomID geom = dCreateBox(space_, sx, sy, sz);
         dGeomSetPosition(geom, x, y, pz);
-        dGeomSetData(geom, (void*)"obstacle");
-        obstacles[totalObstaclesCreated] = geom;
-        obstacleSizes[totalObstaclesCreated][0] = sx;
-        obstacleSizes[totalObstaclesCreated][1] = sy;
-        obstacleSizes[totalObstaclesCreated][2] = sz;
-        totalObstaclesCreated++;
-        if (totalObstaclesCreated >= MAX_OBSTACLES)
-            return;
+        dGeomSetData(geom, const_cast<char*>("obstacle"));
+        
+        obstacles_[numObstacles_] = geom;
+        obstacleSizes_[numObstacles_][0] = sx;
+        obstacleSizes_[numObstacles_][1] = sy;
+        obstacleSizes_[numObstacles_][2] = sz;
+        numObstacles_++;
     }
 }
 
-static void drawObstacles(void)
-{
-    dsSetTexture(DS_SKY);
-    dsSetColor(1.0, 1.0, 1.0);
-    for (int i = 0; i < totalObstaclesCreated; i++) {
-        const dReal* pos = dGeomGetPosition(obstacles[i]);
-        dsDrawBox(pos, dGeomGetRotation(obstacles[i]), obstacleSizes[i]);
-    }
-}
-
-/******************************************************************************
- * initODE: Initialize ODE world and boundaries.
- ******************************************************************************/
-void initODE(void)
-{
-    dInitODE();
-    world = dWorldCreate();
-    space = dHashSpaceCreate(0);
-    contactGroup = dJointGroupCreate(0);
-    dWorldSetGravity(world, 0, 0, -9.81);
-    dWorldSetCFM(world, 1e-5);
-    dWorldSetERP(world, 0.2);
-    dWorldSetQuickStepNumIterations(world, 50);
-    groundPlaneGeom = dCreatePlane(space, 0, 0, 1, 0);
+void Environment::spawnAgents(int count) {
+    using namespace config;
     
-    boundaryBoxes[0] = dCreateBox(space, (60.0 - (-80.0)) + 1.0, 1.0, 5.0);
-    dGeomSetPosition(boundaryBoxes[0], (60.0 + (-80.0))/2.0, 70.0 + 0.5, 5.0/2.0);
-    dGeomSetData(boundaryBoxes[0], (void*)SIDE_WALL);
-    
-    boundaryBoxes[1] = dCreateBox(space, (60.0 - (-80.0)) + 1.0, 1.0, 5.0);
-    dGeomSetPosition(boundaryBoxes[1], (60.0 + (-80.0))/2.0, -70.0 - 0.5, 5.0/2.0);
-    dGeomSetData(boundaryBoxes[1], (void*)SIDE_WALL);
-    
-    boundaryBoxes[2] = dCreateBox(space, 1.0, (70.0 - (-70.0)) + 1.0, 5.0);
-    dGeomSetPosition(boundaryBoxes[2], -80.0 - 0.5, 0.0, 5.0/2.0);
-    dGeomSetData(boundaryBoxes[2], (void*)SPAWN_WALL);
-    
-    boundaryBoxes[3] = dCreateBox(space, 1.0, (70.0 - (-70.0)) + 1.0, 5.0);
-    dGeomSetPosition(boundaryBoxes[3], 60.0 + 0.5, 0.0, 5.0/2.0);
-    dGeomSetData(boundaryBoxes[3], (void*)FAR_WALL);
-    
-    double targetRadius = 2.0;
-    targetBall = dBodyCreate(world);
-    dMass m;
-    dMassSetSphere(&m, 2.0, targetRadius);
-    dBodySetMass(targetBall, &m);
-    targetBallGeom = dCreateSphere(space, targetRadius);
-    dGeomSetBody(targetBallGeom, targetBall);
-    dBodySetPosition(targetBall, 55.0, 0.0, 20.0);
-}
-
-/******************************************************************************
- * cleanupODE: Clean up ODE resources.
- ******************************************************************************/
-void cleanupODE(void)
-{
-    dJointGroupDestroy(contactGroup);
-    dSpaceDestroy(space);
-    dWorldDestroy(world);
-    dCloseODE();
-}
-
-/******************************************************************************
- * helper: convert HSV to RGB
- ******************************************************************************/
-// Converts HSV (h in [0,360], s and v in [0,1]) to RGB in [0,1].
-static void hsv2rgb(double h, double s, double v, float &r, float &g, float &b) {
-    double c = v * s;
-    double h_prime = fmod(h / 60.0, 6);
-    double x = c * (1 - fabs(fmod(h_prime, 2) - 1));
-    double m = v - c;
-    double r1, g1, b1;
-    if (0 <= h_prime && h_prime < 1) { r1 = c; g1 = x; b1 = 0; }
-    else if (1 <= h_prime && h_prime < 2) { r1 = x; g1 = c; b1 = 0; }
-    else if (2 <= h_prime && h_prime < 3) { r1 = 0; g1 = c; b1 = x; }
-    else if (3 <= h_prime && h_prime < 4) { r1 = 0; g1 = x; b1 = c; }
-    else if (4 <= h_prime && h_prime < 5) { r1 = x; g1 = 0; b1 = c; }
-    else { r1 = c; g1 = 0; b1 = x; }
-    r = (float)(r1 + m);
-    g = (float)(g1 + m);
-    b = (float)(b1 + m);
-}
-
-/******************************************************************************
- * getEnvironmentHeight: Return environment height at a point.
- ******************************************************************************/
-static double getEnvironmentHeight(double x, double y)
-{
-    double height = 0.0;
-    for (int i = 0; i < totalObstaclesCreated; i++) {
-        const dReal* pos = dGeomGetPosition(obstacles[i]);
-        double sx = obstacleSizes[i][0];
-        double sy = obstacleSizes[i][1];
-        double half_sx = sx / 2.0;
-        double half_sy = sy / 2.0;
-        if (x >= pos[0]-half_sx && x <= pos[0]+half_sx &&
-            y >= pos[1]-half_sy && y <= pos[1]+half_sy) {
-            double top = pos[2] + (obstacleSizes[i][2] / 2.0);
-            if (top > height)
-                height = top;
-        }
-    }
-    return height;
-}
-
-/******************************************************************************
- * replaceQuadruped: Replace a quadruped.
- ******************************************************************************/
-static void replaceQuadruped(int index)
-{
-    Quadruped *quad = &wobjects.quads[index];
-    if (quad->body) { dBodyDestroy(quad->body); quad->body = 0; }
-    if (quad->bodyGeom) { dGeomDestroy(quad->bodyGeom); quad->bodyGeom = 0; }
-    for (int j = 0; j < 4; j++) {
-        if (quad->leg[j]) { dBodyDestroy(quad->leg[j]); quad->leg[j] = 0; }
-        if (quad->legGeom[j]) { dGeomDestroy(quad->legGeom[j]); quad->legGeom[j] = 0; }
-        if (quad->hip[j]) { dJointDestroy(quad->hip[j]); quad->hip[j] = 0; }
-        if (quad->wheelJoint[j]) { dJointDestroy(quad->wheelJoint[j]); quad->wheelJoint[j] = 0; }
-        if (quad->wheel[j]) { dBodyDestroy(quad->wheel[j]); quad->wheel[j] = 0; }
-        if (quad->wheelTransform[j]) { dGeomDestroy(quad->wheelTransform[j]); quad->wheelTransform[j] = 0; }
-    }
-    for (int k = 0; k < NUM_RAYS; k++) {
-        if (quad->raySensors[k]) { dGeomDestroy(quad->raySensors[k]); quad->raySensors[k] = 0; }
-    }
-    quad->respawnCount++;
-    quad->lastRespawnTime = simulationTime;
-    
-    // Heavy penalty for replacement.
-    double dummy[ACTOR_OUTPUTS];
-    runNeuralNetwork(quad, -200.0, dummy);
-    quad->fitness -= 500.0;
-    
+    numQuadrupeds_ = count;
     double margin = 2.0;
-    double startX = -80.0 + margin;
-    double startY = -70.0 + margin;
-    double endY = 80.0 - margin;
-    double spacing = (NUM_QUADRUPEDS > 1) ? (endY - startY) / (NUM_QUADRUPEDS - 1) : 0;
-    double x = startX;
-    double y = startY + index * spacing;
-    createQuadruped(quad, x, y);
+    double startX = WORLD_X_MIN + margin;
+    double startY = WORLD_Y_MIN + margin;
+    double endY = WORLD_Y_MAX - margin;
+    double spacing = (count > 1) ? (endY - startY) / (count - 1) : 0;
+    
+    for (int i = 0; i < count; i++) {
+        double x = startX;
+        double y = startY + i * spacing;
+        physics::createQuadruped(world_, space_, &quads_[i], x, y, 
+                                 simulationTime_, targetBall_,
+                                 obstacles_, obstacleSizes_, numObstacles_);
+    }
 }
 
-/******************************************************************************
- * nearCallback: Collision callback.
- ******************************************************************************/
-static void nearCallback(void *data, dGeomID o1, dGeomID o2)
-{
-    // Skip collisions involving rays.
-    if (dGeomGetClass(o1) == dRayClass || dGeomGetClass(o2) == dRayClass)
+dsFunctions Environment::getCallbacks() {
+    dsFunctions fn;
+    fn.version = DS_VERSION;
+    fn.start = &Environment::startCallback;
+    fn.step = &Environment::simLoopCallback;
+    fn.command = &Environment::commandCallback;
+    fn.stop = &Environment::stopCallback;
+    fn.path_to_textures = TEXTURE_PATH;
+    return fn;
+}
+
+void Environment::cleanup() {
+    if (world_) {
+        physics::cleanup(world_, space_, contactGroup_);
+        world_ = nullptr;
+        space_ = nullptr;
+        contactGroup_ = nullptr;
+    }
+}
+
+void Environment::startCallback() {
+    if (!instance_) return;
+    
+    const dReal* quadPos = dBodyGetPosition(instance_->quads_[0].body);
+    float xyz[3] = {
+        static_cast<float>(quadPos[0] + 3.0),
+        static_cast<float>(quadPos[1] - 2.0),
+        static_cast<float>(quadPos[2] + 2.5)
+    };
+    float hpr[3] = {90.0f, -15.0f, 0.0f};
+    dsSetViewpoint(xyz, hpr);
+    
+    std::printf("MultiSim Controls:\n");
+    std::printf("  'p' - Pause simulation\n");
+    std::printf("  'q' - Quit\n");
+}
+
+void Environment::commandCallback(int cmd) {
+    if (cmd == 'q') {
+        dsStop();
+    }
+}
+
+void Environment::stopCallback() {
+    // Nothing to do
+}
+
+void Environment::nearCallback(void* /*data*/, dGeomID o1, dGeomID o2) {
+    using namespace config;
+    
+    if (!instance_) return;
+    
+    // Skip collisions involving rays
+    if (dGeomGetClass(o1) == dRayClass || dGeomGetClass(o2) == dRayClass) {
         return;
+    }
     
     dContact contacts[8];
     int n = dCollide(o1, o2, 8, &contacts[0].geom, sizeof(dContact));
+    
     for (int i = 0; i < n; i++) {
         contacts[i].surface.mode = dContactBounce | dContactSoftERP | dContactSoftCFM;
         contacts[i].surface.mu = 1200.0;
         contacts[i].surface.bounce = 0.7;
         contacts[i].surface.soft_erp = 1.0;
         contacts[i].surface.soft_cfm = 1e-4;
-        dJointID c = dJointCreateContact(world, contactGroup, &contacts[i]);
+        
+        dJointID c = dJointCreateContact(instance_->world_, instance_->contactGroup_, &contacts[i]);
         dJointAttach(c, dGeomGetBody(o1), dGeomGetBody(o2));
         
-        // Filter out ground collisions.
-        if (o1 == groundPlaneGeom || o2 == groundPlaneGeom)
+        // Skip ground collisions for penalty calculation
+        if (o1 == instance_->groundPlane_ || o2 == instance_->groundPlane_) {
             continue;
+        }
+        
         void* data1 = dGeomGetData(o1);
         void* data2 = dGeomGetData(o2);
         
-        // --- Handle collisions with obstacles (reduced penalty) ---
-        if (data1 == (void*)"obstacle") {
+        // Handle obstacle collisions
+        if (data1 == static_cast<void*>(const_cast<char*>("obstacle"))) {
             dBodyID b = dGeomGetBody(o2);
             if (b) {
-                Quadruped *quad = (Quadruped*)dBodyGetData(b);
-                if (quad)
-                    quad->collisionPenalty -= 20.0;
+                Quadruped* quad = static_cast<Quadruped*>(dBodyGetData(b));
+                if (quad) {
+                    quad->collisionPenalty += COLLISION_PENALTY;
+                }
             }
-        }
-        else if (data2 == (void*)"obstacle") {
+        } else if (data2 == static_cast<void*>(const_cast<char*>("obstacle"))) {
             dBodyID b = dGeomGetBody(o1);
             if (b) {
-                Quadruped *quad = (Quadruped*)dBodyGetData(b);
-                if (quad)
-                    quad->collisionPenalty -= 20.0;
+                Quadruped* quad = static_cast<Quadruped*>(dBodyGetData(b));
+                if (quad) {
+                    quad->collisionPenalty += COLLISION_PENALTY;
+                }
             }
         }
         
-        // --- Handle collisions involving legs ---
-        if (data1 == (void*)"leg") {
-            dBodyID b = dGeomGetBody(o1);
-            if (b) {
-                Quadruped *quad = (Quadruped*)dBodyGetData(b);
-                dBodyID other = dGeomGetBody(o2);
-                if (!other || dBodyGetData(other) != quad)
-                    quad->collisionPenalty -= 5.0;
-            }
-        }
-        if (data2 == (void*)"leg") {
-            dBodyID b = dGeomGetBody(o2);
-            if (b) {
-                Quadruped *quad = (Quadruped*)dBodyGetData(b);
-                dBodyID other = dGeomGetBody(o1);
-                if (!other || dBodyGetData(other) != quad)
-                    quad->collisionPenalty -= 5.0;
-            }
-        }
-        
-        // --- Handle collisions with walls ---
-        if (data1 == (void*)SIDE_WALL || data1 == (void*)SPAWN_WALL || data1 == (void*)FAR_WALL) {
-            dBodyID b = dGeomGetBody(o2);
-            if (b) {
-                Quadruped *quad = (Quadruped*)dBodyGetData(b);
-                if (quad)
-                    quad->collisionPenalty -= 5.0;
-            }
-        }
-        else if (data2 == (void*)SIDE_WALL || data2 == (void*)SPAWN_WALL || data2 == (void*)FAR_WALL) {
-            dBodyID b = dGeomGetBody(o1);
-            if (b) {
-                Quadruped *quad = (Quadruped*)dBodyGetData(b);
-                if (quad)
-                    quad->collisionPenalty -= 10.0;
+        // Handle wall collisions
+        for (int w = 0; w < 4; w++) {
+            if (o1 == instance_->boundaryBoxes_[w] || o2 == instance_->boundaryBoxes_[w]) {
+                dBodyID b = (o1 == instance_->boundaryBoxes_[w]) ? dGeomGetBody(o2) : dGeomGetBody(o1);
+                if (b) {
+                    Quadruped* quad = static_cast<Quadruped*>(dBodyGetData(b));
+                    if (quad) {
+                        quad->collisionPenalty += WALL_COLLISION_PENALTY;
+                    }
+                }
+                break;
             }
         }
     }
 }
 
-/******************************************************************************
- * hasFallen: Check if quadruped has fallen.
- ******************************************************************************/
-static int hasFallen(Quadruped *quad)
-{
-    const dReal *R = dBodyGetRotation(quad->body);
+bool Environment::hasFallen(Quadruped* quad) {
+    const dReal* R = dBodyGetRotation(quad->body);
     double up_z = R[10];
-    return (up_z < 0.6);
+    return (up_z < config::FALLING_THRESHOLD);
 }
 
-/******************************************************************************
- * updateSensorsAndControl: Update sensors, compute reward, and control.
- ******************************************************************************/
-static void updateSensorsAndControl(Quadruped *quad)
-{
-    // Get current body position and rotation.
-    const dReal *bodyPos = dBodyGetPosition(quad->body);
-    const dReal *bodyR = dBodyGetRotation(quad->body);
+double Environment::getEnvironmentHeight(double x, double y) {
+    double height = 0.0;
+    
+    for (int i = 0; i < numObstacles_; i++) {
+        const dReal* pos = dGeomGetPosition(obstacles_[i]);
+        double sx = obstacleSizes_[i][0];
+        double sy = obstacleSizes_[i][1];
+        double half_sx = sx / 2.0;
+        double half_sy = sy / 2.0;
+        
+        if (x >= pos[0] - half_sx && x <= pos[0] + half_sx &&
+            y >= pos[1] - half_sy && y <= pos[1] + half_sy) {
+            double top = pos[2] + (obstacleSizes_[i][2] / 2.0);
+            if (top > height) {
+                height = top;
+            }
+        }
+    }
+    
+    return height;
+}
 
-    // Update the quadruped's position.
+void Environment::replaceQuadruped(int index) {
+    using namespace config;
+    
+    Quadruped* quad = &quads_[index];
+    physics::destroyQuadruped(quad);
+    
+    quad->respawnCount++;
+    quad->lastRespawnTime = simulationTime_;
+    quad->fitness = 0;
+    
+    // Respawn at starting position
+    double margin = 2.0;
+    double startX = WORLD_X_MIN + margin;
+    double startY = WORLD_Y_MIN + margin;
+    double endY = WORLD_Y_MAX - margin;
+    double spacing = (numQuadrupeds_ > 1) ? (endY - startY) / (numQuadrupeds_ - 1) : 0;
+    double x = startX;
+    double y = startY + index * spacing;
+    
+    physics::createQuadruped(world_, space_, quad, x, y,
+                             simulationTime_, targetBall_,
+                             obstacles_, obstacleSizes_, numObstacles_);
+    
+    quad->prevCriticValue = 0.0;
+}
+
+void Environment::updateSensorsAndControl(Quadruped* quad) {
+    using namespace config;
+    
+    const dReal* bodyPos = dBodyGetPosition(quad->body);
+    const dReal* bodyR = dBodyGetRotation(quad->body);
+    
+    // Update position and orientation
     quad->x = bodyPos[0];
     quad->y = bodyPos[1];
-
-    // Compute orientation (yaw) from the rotation matrix.
-    double yaw = atan2(bodyR[4], bodyR[0]);
-    quad->orientation = yaw;
-
-    // Update sensor rays (full circle) 
+    quad->orientation = std::atan2(bodyR[4], bodyR[0]);
+    
+    // Update sensor rays (full circle)
     for (int i = 0; i < NUM_RAYS; i++) {
         double angle = quad->orientation + (2 * M_PI * i / NUM_RAYS);
         double sensorX = bodyPos[0];
         double sensorY = bodyPos[1];
         double sensorZ = bodyPos[2];
-        double dirX = cos(angle);
-        double dirY = sin(angle);
+        double dirX = std::cos(angle);
+        double dirY = std::sin(angle);
         double dirZ = 0.0;
         dGeomRaySet(quad->raySensors[i], sensorX, sensorY, sensorZ, dirX, dirY, dirZ);
     }
-
+    
     // Sensor collision checks
+    bool ballHit = false;
+    double bestBallVal = 1.0;
+    int bestBallIdx = -1;
+    
     for (int idx = 0; idx < NUM_RAYS; idx++) {
         double minReading = 1.0;
         dContactGeom contact;
-        int n = dCollide(quad->raySensors[idx], groundPlaneGeom, 1, &contact, sizeof(dContactGeom));
+        
+        // Check ground
+        int n = dCollide(quad->raySensors[idx], groundPlane_, 1, &contact, sizeof(dContactGeom));
         if (n > 0) {
             double reading = contact.depth / SENSOR_MAX_DIST;
-            if (reading < minReading)
-                minReading = reading;
+            if (reading < minReading) minReading = reading;
         }
-        // Check against obstacles.
-        for (int obs = 0; obs < totalObstaclesCreated; obs++) {
-            n = dCollide(quad->raySensors[idx], obstacles[obs], 1, &contact, sizeof(dContactGeom));
+        
+        // Check obstacles
+        for (int obs = 0; obs < numObstacles_; obs++) {
+            n = dCollide(quad->raySensors[idx], obstacles_[obs], 1, &contact, sizeof(dContactGeom));
             if (n > 0) {
                 double reading = contact.depth / SENSOR_MAX_DIST;
-                if (reading < minReading)
-                    minReading = reading;
+                if (reading < minReading) minReading = reading;
             }
         }
-        // Check against wall geometries.
+        
+        // Check walls
         for (int w = 0; w < 4; w++) {
-            n = dCollide(quad->raySensors[idx], boundaryBoxes[w], 1, &contact, sizeof(dContactGeom));
+            n = dCollide(quad->raySensors[idx], boundaryBoxes_[w], 1, &contact, sizeof(dContactGeom));
             if (n > 0) {
                 double reading = contact.depth / SENSOR_MAX_DIST;
-                if (reading < minReading)
-                    minReading = reading;
+                if (reading < minReading) minReading = reading;
             }
         }
-        if (minReading > 1.0)
-            minReading = 1.0;
+        
+        // Check target ball
+        n = dCollide(quad->raySensors[idx], targetBallGeom_, 1, &contact, sizeof(dContactGeom));
+        if (n > 0) {
+            double reading = contact.depth / SENSOR_MAX_DIST;
+            if (reading < minReading) minReading = reading;
+            if (reading < bestBallVal) {
+                bestBallVal = reading;
+                ballHit = true;
+                bestBallIdx = idx;
+            }
+        }
+        
+        if (minReading > 1.0) minReading = 1.0;
         quad->sensorValues[idx] = minReading;
     }
-
-    // Compute current target distance 
-    const dReal* targetPos = dBodyGetPosition(targetBall);
+    
+    quad->ballVisible = ballHit;
+    quad->ballVisionValue = ballHit ? bestBallVal : 1.0;
+    quad->ballRayIndex = bestBallIdx;
+    
+    // Compute target distance
+    const dReal* targetPos = dBodyGetPosition(targetBall_);
     double dx = targetPos[0] - bodyPos[0];
     double dy = targetPos[1] - bodyPos[1];
     double dz = targetPos[2] - bodyPos[2];
-    double currentTargetDistance = sqrt(dx * dx + dy * dy + dz * dz);
+    double currentTargetDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
     quad->distanceToTarget = currentTargetDistance;
-
-    // Continuous reward based on target distance improvement
-    double distanceImprovement = quad->prevTargetDistance - currentTargetDistance;
-    // Positive reward if getting closer, negative otherwise.
-    double reward = 10.0 * distanceImprovement + 20.0;  
-    quad->prevTargetDistance = currentTargetDistance;
-
-    // Reward for crossing obstacle lines
-    for (int i = 0; i < totalObstaclesCreated; i++) {
-        const dReal* obsPos = dGeomGetPosition(obstacles[i]);
-        double lineX = obsPos[0] + 0.5;
-        if ((quad->prevX < lineX && bodyPos[0] >= lineX) ||
-            (quad->prevX > lineX && bodyPos[0] <= lineX))
-            reward += 20.0;  // Smaller bonus than before.
+    quad->targetX = targetPos[0];
+    quad->targetY = targetPos[1];
+    
+    // === REWARD CALCULATION ===
+    double reward = 0.0;
+    
+    // Goal reached (terminal success)
+    if (currentTargetDistance < GOAL_DISTANCE) {
+        reward = GOAL_REWARD;
+        double actions[ACTOR_OUTPUTS];
+        runNeuralNetwork(quad, reward, actions);
+        int index = static_cast<int>(quad - quads_);
+        replaceQuadruped(index);
+        return;
     }
+    
+    // Timeout (terminal failure)
+    if (simulationTime_ - quad->spawnTime > EPISODE_TIMEOUT) {
+        reward = TIMEOUT_PENALTY;
+        double actions[ACTOR_OUTPUTS];
+        runNeuralNetwork(quad, reward, actions);
+        int index = static_cast<int>(quad - quads_);
+        replaceQuadruped(index);
+        return;
+    }
+    
+    // Distance improvement reward (main signal)
+    double distanceImprovement = quad->prevTargetDistance - currentTargetDistance;
+    reward += DISTANCE_SCALE * distanceImprovement;
+    quad->prevTargetDistance = currentTargetDistance;
+    
+    // Collision penalty
+    if (quad->collisionPenalty < 0) {
+        reward += quad->collisionPenalty * 0.3;
+    }
+    quad->collisionPenalty = 0.0;
+    
+    // Obstacle clearance penalty
+    const dReal* bodyVel = dBodyGetLinearVel(quad->body);
+    double speed = std::sqrt(bodyVel[0] * bodyVel[0] + bodyVel[1] * bodyVel[1]);
+    
+    if (speed > 0.3) {
+        double minSensorDist = 1.0;
+        for (int i = 0; i < NUM_RAYS; i++) {
+            if (quad->sensorValues[i] < minSensorDist) {
+                minSensorDist = quad->sensorValues[i];
+            }
+        }
+        
+        if (minSensorDist < 0.3) {
+            reward -= 1.0;
+        } else if (minSensorDist < 0.5) {
+            reward -= 0.3;
+        }
+    }
+    
+    // Milestone bonuses
+    double forwardProgress = bodyPos[0] - quad->prevX;
+    if (forwardProgress > 3.0) {
+        reward += 20.0;
+    } else if (forwardProgress > 1.5) {
+        reward += 10.0;
+    }
+    
+    // Stability penalty
+    double upright = bodyR[10];
+    if (upright < 0.6) {
+        reward -= 2.0;
+    }
+    
+    // Time penalty
+    reward += TIME_PENALTY;
+    
     quad->prevX = bodyPos[0];
     quad->prevY = bodyPos[1];
-
-    // Incorporate collision penalty (add rather than overwrite) 
-    reward += quad->collisionPenalty;
-    quad->collisionPenalty = 0.0;
-
-    // Blinking feedback (unchanged) 
+    
+    // Visual feedback
     if (quad->blinkCount == 0) {
-        if (reward >= 10) {
+        if (reward >= 3.0) {
             quad->blinkType = BLINK_GREEN;
             quad->blinkCount = 1;
-            quad->blinkStartTime = simulationTime;
-        } else if (reward <= -10) {
+            quad->blinkStartTime = simulationTime_;
+        } else if (reward <= -1.5) {
             quad->blinkType = BLINK_RED;
             quad->blinkCount = 1;
-            quad->blinkStartTime = simulationTime;
-        }
-        else {
+            quad->blinkStartTime = simulationTime_;
+        } else {
             quad->blinkType = BLINK_NONE;
         }
     }
-
-    // Run the neural network with the computed reward
-    double actions[ACTOR_OUTPUTS];
-    runNeuralNetwork(quad, reward, actions);
-
-    // Select and execute the action with the highest output 
-    int state = 0;
-    double maxVal = actions[0];
-    for (int i = 1; i < ACTOR_OUTPUTS; i++) {
-        if (actions[i] > maxVal) { maxVal = actions[i]; state = i; }
+    
+    // Check if fallen
+    if (hasFallen(quad)) {
+        reward = FALLING_PENALTY;
     }
-    switch (state) {
-        case 0:
+    
+    // Run neural network
+    double actions[ACTOR_OUTPUTS];
+    int chosen_action = runNeuralNetwork(quad, reward, actions);
+    
+    // Execute action
+    switch (chosen_action) {
+        case 0:  // Forward
             for (int i = 0; i < 4; i++) {
-                dJointSetHingeParam(quad->wheelJoint[i], dParamVel, -40);
+                dJointSetHingeParam(quad->wheelJoint[i], dParamVel, WHEEL_VEL_FORWARD);
             }
             break;
-        case 1:
-            dJointSetHingeParam(quad->wheelJoint[0], dParamVel, -40);
-            dJointSetHingeParam(quad->wheelJoint[2], dParamVel, -40);
-            dJointSetHingeParam(quad->wheelJoint[1], dParamVel, 10);
-            dJointSetHingeParam(quad->wheelJoint[3], dParamVel, 10);
+        case 1:  // Turn left
+            dJointSetHingeParam(quad->wheelJoint[0], dParamVel, WHEEL_VEL_TURN_FAST);
+            dJointSetHingeParam(quad->wheelJoint[2], dParamVel, WHEEL_VEL_TURN_FAST);
+            dJointSetHingeParam(quad->wheelJoint[1], dParamVel, WHEEL_VEL_TURN_SLOW);
+            dJointSetHingeParam(quad->wheelJoint[3], dParamVel, WHEEL_VEL_TURN_SLOW);
             break;
-        case 2:
-            dJointSetHingeParam(quad->wheelJoint[0], dParamVel, 40);
-            dJointSetHingeParam(quad->wheelJoint[2], dParamVel, 40);
-            dJointSetHingeParam(quad->wheelJoint[1], dParamVel, -10);
-            dJointSetHingeParam(quad->wheelJoint[3], dParamVel, -10);
+        case 2:  // Turn right
+            dJointSetHingeParam(quad->wheelJoint[0], dParamVel, -WHEEL_VEL_TURN_FAST);
+            dJointSetHingeParam(quad->wheelJoint[2], dParamVel, -WHEEL_VEL_TURN_FAST);
+            dJointSetHingeParam(quad->wheelJoint[1], dParamVel, -WHEEL_VEL_TURN_SLOW);
+            dJointSetHingeParam(quad->wheelJoint[3], dParamVel, -WHEEL_VEL_TURN_SLOW);
             break;
-        case 3:
+        case 3:  // Backward
             for (int i = 0; i < 4; i++) {
-                dJointSetHingeParam(quad->wheelJoint[i], dParamVel, 30);
+                dJointSetHingeParam(quad->wheelJoint[i], dParamVel, WHEEL_VEL_BACK);
             }
-            break;
-        default:
             break;
     }
 }
 
-/******************************************************************************
- * simLoop: Main simulation loop.
- ******************************************************************************/
-static void simLoop(int pause)
-{
+void Environment::simLoopCallback(int pause) {
+    using namespace config;
+    
+    if (!instance_) return;
+    
     if (!pause) {
-        simulationTime += SIMULATION_DT;
-        for (int i = 0; i < NUM_QUADRUPEDS; i++) {
-            Quadruped *quad = &wobjects.quads[i];
+        instance_->simulationTime_ += SIMULATION_DT;
+        
+        // Process all quadrupeds
+        for (int i = 0; i < instance_->numQuadrupeds_; i++) {
+            Quadruped* quad = &instance_->quads_[i];
             if (!quad->body) continue;
-            updateSensorsAndControl(quad);
-            const dReal *pos = dBodyGetPosition(quad->body);
+            
+            instance_->updateSensorsAndControl(quad);
+            
+            const dReal* pos = dBodyGetPosition(quad->body);
             quad->fitness = pos[0];
-            // If the quadruped has fallen, apply a reduced penalty.
-            if (hasFallen(quad)) {
-                double dummy[ACTOR_OUTPUTS];
-                runNeuralNetwork(quad, -500.0, dummy);  // Reduced falling penalty.
-                replaceQuadruped(i);
-                continue;
-            }
-            const dReal *bodyR = dBodyGetRotation(quad->body);
-            dVector3 forward = { bodyR[0], bodyR[4], bodyR[8] };
-            // If the forward vector is below threshold, apply a reduced side-wall penalty.
-            if (fabs(forward[0]) < SIDE_WALL_THRESHOLD) {
-                double dummy[ACTOR_OUTPUTS];
-                runNeuralNetwork(quad, -50.0, dummy);  // Reduced side-wall penalty.
-                replaceQuadruped(i);
+            
+            if (instance_->hasFallen(quad)) {
+                instance_->replaceQuadruped(i);
                 continue;
             }
         }
         
-        // Global weight-change blink 
+        // Batch update neural network
+        applyBatchUpdate();
+        
+        // Global weight change blink
         if (globalWeightChangeBlink > 0) {
-            for (int i = 0; i < NUM_QUADRUPEDS; i++) {
-                wobjects.quads[i].blinkType = BLINK_BLUE;
-                wobjects.quads[i].blinkCount = 2;
-                wobjects.quads[i].blinkStartTime = simulationTime;
+            for (int i = 0; i < instance_->numQuadrupeds_; i++) {
+                instance_->quads_[i].blinkType = BLINK_BLUE;
+                instance_->quads_[i].blinkCount = 2;
+                instance_->quads_[i].blinkStartTime = instance_->simulationTime_;
             }
             globalWeightChangeBlink = 0.0;
         }
         
-        dSpaceCollide(space, 0, &nearCallback);
-        dWorldQuickStep(world, SIMULATION_DT);
-        dJointGroupEmpty(contactGroup);
-        for (int i = 0; i < NUM_QUADRUPEDS; i++) {
-            Quadruped *quad = &wobjects.quads[i];
-            if (quad->body)
-                safeNormalizeBodyRotation(quad->body);
+        // Physics step
+        dSpaceCollide(instance_->space_, nullptr, &Environment::nearCallback);
+        dWorldQuickStep(instance_->world_, SIMULATION_DT);
+        dJointGroupEmpty(instance_->contactGroup_);
+        
+        // Normalize rotations
+        for (int i = 0; i < instance_->numQuadrupeds_; i++) {
+            Quadruped* quad = &instance_->quads_[i];
+            if (quad->body) {
+                physics::safeNormalizeBodyRotation(quad->body);
+            }
         }
-        safeNormalizeBodyRotation(targetBall);
+        physics::safeNormalizeBodyRotation(instance_->targetBall_);
     }
     
-    #if USE_TEXTURE
-    dsSetTexture(DS_CHECKERED);
-    #endif
-    dsSetColor(1.0, 1.0, 1.0);
-    float groundSize[3] = {10.0f, 10.0f, 0.01f};
-    float groundPos[3]  = {0.0f, 0.0f, 0.0f};
-    float groundRot[12] = {1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0};
-    dsDrawBox(groundPos, groundRot, groundSize);
-    dsSetTexture(DS_GROUND);
+    // === RENDERING ===
+    rendering::drawGround();
+    rendering::drawBoundaryWalls(instance_->boundaryBoxes_);
+    rendering::drawObstacles(instance_->obstacles_, instance_->obstacleSizes_, instance_->numObstacles_);
+    rendering::drawObstacleLines(instance_->obstacles_, instance_->obstacleSizes_, instance_->numObstacles_);
+    rendering::drawTargetBall(instance_->targetBall_);
+    rendering::drawAllSensorRays(instance_->quads_, instance_->numQuadrupeds_);
     
-    for (int i = 0; i < 4; i++) {
-        const dReal* pos = dGeomGetPosition(boundaryBoxes[i]);
-        const dReal* rot = dGeomGetRotation(boundaryBoxes[i]);
-        dVector3 dims;
-        if (i < 2) {
-            dims[0] = (60.0 - (-80.0)) + 1.0;
-            dims[1] = 1.0;
-            dims[2] = 5.0;
-        } else {
-            dims[0] = 1.0;
-            dims[1] = (70.0 - (-70.0)) + 1.0;
-            dims[2] = 5.0;
-        }
-        dsDrawBox(pos, rot, dims);
+    for (int i = 0; i < instance_->numQuadrupeds_; i++) {
+        rendering::drawQuadruped(&instance_->quads_[i], instance_->simulationTime_);
     }
     
-    drawObstacles();
-    drawObstacleLines();
+    // Draw HUD
+    char textBuffer[64];
+    int countInside = 0;
+    for (int i = 0; i < instance_->numQuadrupeds_; i++) {
+        Quadruped* quad = &instance_->quads_[i];
+        if (quad->body) {
+            const dReal* pos = dBodyGetPosition(quad->body);
+            if (std::fabs(pos[0]) <= 60.0 && std::fabs(pos[1]) <= 35.0) {
+                countInside++;
+            }
+        }
+    }
+    std::snprintf(textBuffer, sizeof(textBuffer), "Quadrupeds in Course: %d", countInside);
     
-    dsSetTexture(DS_SKY);
-    dsSetColor(0.0, 1.0, 0.0);
-    const dReal* tPos = dBodyGetPosition(targetBall);
-    dsDrawSphere(tPos, dBodyGetRotation(targetBall), 2.0);
-    
-    //  Updated Sensor Drawing Code (Full Circle with Gradient) 
     glPushAttrib(GL_ENABLE_BIT);
     glDisable(GL_LIGHTING);
-    glLineWidth(1.25);
-    glBegin(GL_LINES);
-    
-    // For each quadruped, draw its sensor rays in a full circle.
-    for (int q = 0; q < NUM_QUADRUPEDS; q++) {
-        Quadruped *quad = &wobjects.quads[q];
-        if (!quad->body) continue;
-        const dReal *bodyPos = dBodyGetPosition(quad->body);
-        double baseAngle = quad->orientation; // Updated in updateSensorsAndControl.
-        for (int i = 0; i < NUM_RAYS; i++) {
-            // Compute the angle for this sensor.
-            double angle = baseAngle + (2 * M_PI * i / NUM_RAYS);
-            dVector3 sensorOrigin = { bodyPos[0], bodyPos[1], bodyPos[2] };
-            dVector3 sensorDir = { cos(angle), sin(angle), 0.0 };
-            
-            // The sensor's reading is in [0,1]. We map 0 -> red (hue=0) and 1 -> blue (hue=240).
-            double hue = quad->sensorValues[i] * 240.0;
-            float r, g, b;
-            hsv2rgb(hue, 1.0, 1.0, r, g, b);
-            
-            // Draw length is based on the sensor reading.
-            double drawLength = DRAWN_MAX_LENGTH * quad->sensorValues[i];
-            glColor3f(r, g, b);
-            
-            glVertex3d(sensorOrigin[0], sensorOrigin[1], sensorOrigin[2]);
-            glVertex3d(sensorOrigin[0] + sensorDir[0] * drawLength,
-                       sensorOrigin[1] + sensorDir[1] * drawLength,
-                       sensorOrigin[2] + sensorDir[2] * drawLength);
-        }
-    }
-    
-    glEnd();
+    rendering::drawText(textBuffer, 10.0f, 10.0f);
     glPopAttrib();
-    
-    // Quadruped Drawing Code 
-    for (int i = 0; i < NUM_QUADRUPEDS; i++) {
-        Quadruped *quad = &wobjects.quads[i];
-        if (quad->body) {
-            const dReal *bodyPos = dBodyGetPosition(quad->body);
-            float color[3] = {1.0f, 1.0f, 1.0f};
-            double elapsed = simulationTime - quad->blinkStartTime;
-            if (quad->blinkCount > 0 && elapsed < quad->blinkCount * BLINK_PERIOD) {
-                if (fmod(elapsed, BLINK_PERIOD) < (BLINK_PERIOD / 2)) {
-                    switch (quad->blinkType) {
-                        case BLINK_GREEN:
-                            color[0] = 0.0f; color[1] = 1.0f; color[2] = 0.0f;
-                            break;
-                        case BLINK_RED:
-                            color[0] = 1.0f; color[1] = 0.0f; color[2] = 0.0f;
-                            break;
-                        case BLINK_BLUE:
-                            color[0] = 0.0f; color[1] = 0.0f; color[2] = 1.0f;
-                            break;
-                        default:
-                            break;
-                    }
-                }
-            } else if (quad->blinkCount > 0) {
-                quad->blinkCount = 0;
-                quad->blinkType = BLINK_NONE;
-            }
-            dsSetColor(color[0], color[1], color[2]);
-            dsSetTexture(DS_WOOD);
-            dVector3 sides = {BODY_LENGTH, BODY_WIDTH, BODY_HEIGHT};
-            dsDrawBox(bodyPos, dBodyGetRotation(quad->body), sides);
-            for (int j = 0; j < 4; j++) {
-                if (quad->leg[j]) {
-                    dVector3 legSides = {LEG_WIDTH, LEG_WIDTH, LEG_LENGTH};
-                    dsDrawBox(dBodyGetPosition(quad->leg[j]), dBodyGetRotation(quad->leg[j]), legSides);
-                }
-                if (quad->wheel[j]) {
-                    dsDrawCylinder(dBodyGetPosition(quad->wheel[j]), dBodyGetRotation(quad->wheel[j]), WHEEL_RADIUS, WHEEL_WIDTH);
-                }
-            }
-        }
-    }
-    
-    {
-        char textBuffer[64];
-        int countInside = 0;
-        for (int i = 0; i < NUM_QUADRUPEDS; i++) {
-            Quadruped *quad = &wobjects.quads[i];
-            if (quad->body) {
-                const dReal* pos = dBodyGetPosition(quad->body);
-                if (fabs(pos[0]) <= 60.0 && fabs(pos[1]) <= 35.0)
-                    countInside++;
-            }
-        }
-        sprintf(textBuffer, "Quadrupeds in Course: %d", countInside);
-        glPushAttrib(GL_ENABLE_BIT);
-        glDisable(GL_LIGHTING);
-        drawText(textBuffer, 10.0f, 10.0f);
-        glPopAttrib();
-    }
-}
-
-/******************************************************************************
- * start: Setup initial view.
- ******************************************************************************/
-static void start(void)
-{
-    const dReal *quadPos = dBodyGetPosition(wobjects.quads[0].body);
-    float xyz[3] = { quadPos[0] + 3.0f, quadPos[1] - 2.0f, quadPos[2] + 2.5f };
-    float hpr[3] = {90.0f, -15.0f, 0.0f};
-    dsSetViewpoint(xyz, hpr);
-    printf("Press 'p' to pause, 'q' to quit.\n");
-}
-
-/******************************************************************************
- * command: Keyboard callback.
- ******************************************************************************/
-static void command(int cmd)
-{
-    if (cmd == 'q')
-        dsStop();
-}
-
-/******************************************************************************
- * stop: Stop callback.
- ******************************************************************************/
-static void stop(void)
-{
-}
-
-/******************************************************************************
- * randomUniform: Return a random double between min and max.
- ******************************************************************************/
-static double randomUniform(double min, double max) {
-    return min + ((double)rand() / RAND_MAX) * (max - min);
-}
-
-/******************************************************************************
- * main: Main function.
- ******************************************************************************/
-int main(int argc, char *argv[])
-{
-    srand((unsigned)time(NULL));
-#ifdef DS_EXPORT
-    dsFunctions dsFunc;
-    dsFunc.version = DS_VERSION;
-    dsFunc.start = &start;
-    dsFunc.step = &simLoop;
-    dsFunc.command = &command;
-    dsFunc.stop = &stop;
-    dsFunc.path_to_textures = "/Users/willnorden/Downloads/ode-0.16.6/drawstuff/textures";
-#else
-    dsFunctions dsFunc = { DS_VERSION, &start, &simLoop, &command, &stop,
-        "/Users/willnorden/Downloads/ode-0.16.6/drawstuff/textures" };
-#endif
-
-    initODE();
-    createStaticObstacles(2000, 1.0, 1.0);
-    initNetwork();
-    
-    double margin = 2.0;
-    double startX = -80.0 + margin;
-    double startY = -70.0 + margin;
-    double endY = 80.0 - margin;
-    double spacing = (NUM_QUADRUPEDS > 1) ? (endY - startY) / (NUM_QUADRUPEDS - 1) : 0;
-    for (int i = 0; i < NUM_QUADRUPEDS; i++) {
-        double x = startX;
-        double y = startY + i * spacing;
-        createQuadruped(&wobjects.quads[i], x, y);
-    }
-    
-    dsSimulationLoop(argc, argv, 640, 480, &dsFunc);
-    cleanupODE();
-    return 0;
 }

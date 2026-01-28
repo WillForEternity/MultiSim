@@ -1,41 +1,37 @@
 // neural_network.cpp
-#include "../include/neural_network.h"
-#include "../include/common.h"
-#include "../include/quadruped.h"
-#include "../include/socket.h"
-#include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
-#include <string.h>
-#include <sstream>    
+// Actor-Critic (A2C) reinforcement learning implementation.
+// Uses Adam optimizer with batch gradient accumulation.
+
+#include "neural_network.h"
+#include "common.h"
+#include "config.h"
+#include "csv_export.h"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <cstring>
+#include <sstream>
 #include <string>
 
-// --- Hyperparameters ---
-const double ACTOR_LR = 0.005;
-const double CRITIC_LR = 0.005;
-const double GAMMA = 0.9;
-const double ALPHA_ENTROPY = 0.005;
-const double POLYAK = 0.05;
+using namespace config;
 
-// --- Adam parameters ---
-const AdamParams adamDefault = {0.001, 0.9, 0.999, 1e-8};
-
-// Global blink trigger variables.
+// === Global State ===
 double globalWeightChangeBlink = 0.0;
 bool globalInitNetworkCalled = false;
 
-// --- Network parameter arrays ---
-// Actor network: Layer 1
+// === Network Parameter Arrays ===
+
+// Actor network: Layer 1 (input -> hidden)
 static double actor_W1[HIDDEN_SIZE][NUM_INPUTS];
 static double actor_b1[HIDDEN_SIZE];
-// Adam moment estimates for actor_W1 and actor_b1:
 static double actor_W1_m[HIDDEN_SIZE][NUM_INPUTS] = {0};
 static double actor_W1_v[HIDDEN_SIZE][NUM_INPUTS] = {0};
 static double actor_b1_m[HIDDEN_SIZE] = {0};
 static double actor_b1_v[HIDDEN_SIZE] = {0};
 
-// Actor network: Layer 2
+// Actor network: Layer 2 (hidden -> output)
 static double actor_W2[ACTOR_OUTPUTS][HIDDEN_SIZE];
 static double actor_b2[ACTOR_OUTPUTS];
 static double actor_W2_m[ACTOR_OUTPUTS][HIDDEN_SIZE] = {0};
@@ -43,7 +39,7 @@ static double actor_W2_v[ACTOR_OUTPUTS][HIDDEN_SIZE] = {0};
 static double actor_b2_m[ACTOR_OUTPUTS] = {0};
 static double actor_b2_v[ACTOR_OUTPUTS] = {0};
 
-// Critic network: Layer 1
+// Critic network: Layer 1 (input -> hidden)
 static double critic_W1[HIDDEN_SIZE][NUM_INPUTS];
 static double critic_b1[HIDDEN_SIZE];
 static double critic_W1_m[HIDDEN_SIZE][NUM_INPUTS] = {0};
@@ -51,7 +47,7 @@ static double critic_W1_v[HIDDEN_SIZE][NUM_INPUTS] = {0};
 static double critic_b1_m[HIDDEN_SIZE] = {0};
 static double critic_b1_v[HIDDEN_SIZE] = {0};
 
-// Critic network: Layer 2 (output)
+// Critic network: Layer 2 (hidden -> output, single value)
 static double critic_W2[1][HIDDEN_SIZE];
 static double critic_b2[1];
 static double critic_W2_m[HIDDEN_SIZE] = {0};
@@ -59,123 +55,147 @@ static double critic_W2_v[HIDDEN_SIZE] = {0};
 static double critic_b2_m = 0;
 static double critic_b2_v = 0;
 
-// Target critic network.
-static double critic_W1_target[HIDDEN_SIZE][NUM_INPUTS];
-static double critic_b1_target[HIDDEN_SIZE];
-static double critic_W2_target[1][HIDDEN_SIZE];
-static double critic_b2_target[1];
+// === Gradient Accumulators (for batch updates) ===
+static double actor_W1_grad[HIDDEN_SIZE][NUM_INPUTS] = {0};
+static double actor_b1_grad[HIDDEN_SIZE] = {0};
+static double actor_W2_grad[ACTOR_OUTPUTS][HIDDEN_SIZE] = {0};
+static double actor_b2_grad[ACTOR_OUTPUTS] = {0};
+static double critic_W1_grad[HIDDEN_SIZE][NUM_INPUTS] = {0};
+static double critic_b1_grad[HIDDEN_SIZE] = {0};
+static double critic_W2_grad[HIDDEN_SIZE] = {0};
+static double critic_b2_grad = 0;
+static int batch_count = 0;
 
-// Global time steps for Adam.
+// Adam optimizer timesteps
 static int actor_time = 1;
 static int critic_time = 1;
 
-// --- Helper: Adam update for a single parameter ---
-// Note: This function uses C++ references, so it must not be wrapped in extern "C".
-static void adam_update(double &param, double grad, double &m, double &v, int t, const AdamParams &adam) {
-    m = adam.beta1 * m + (1 - adam.beta1) * grad;
-    v = adam.beta2 * v + (1 - adam.beta2) * (grad * grad);
-    double m_hat = m / (1 - pow(adam.beta1, t));
-    double v_hat = v / (1 - pow(adam.beta2, t));
-    param += adam.lr * m_hat / (sqrt(v_hat) + adam.epsilon);
-    param = clamp(param, -2.0, 2.0);
+// === Helper Functions ===
+
+/// Adam optimizer update for a single parameter.
+static void adam_update(double& param, double grad, double& m, double& v, 
+                        int t, double lr) {
+    // Clip gradients
+    grad = clamp(grad, -GRADIENT_CLIP, GRADIENT_CLIP);
+    
+    // Update moment estimates
+    m = ADAM_BETA1 * m + (1 - ADAM_BETA1) * grad;
+    v = ADAM_BETA2 * v + (1 - ADAM_BETA2) * (grad * grad);
+    
+    // Bias correction
+    double m_hat = m / (1 - std::pow(ADAM_BETA1, t));
+    double v_hat = v / (1 - std::pow(ADAM_BETA2, t));
+    
+    // Update parameter
+    param += lr * m_hat / (std::sqrt(v_hat) + ADAM_EPSILON);
+    
+    // Clamp parameters to prevent extreme values
+    param = clamp(param, -5.0, 5.0);
 }
 
-// --- Xavier Initialization for all parameters ---
+/// Softmax activation function.
+static void softmax(const double* z, int n, double* p) {
+    double max_z = z[0];
+    for (int i = 1; i < n; i++) {
+        if (z[i] > max_z) max_z = z[i];
+    }
+    
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        p[i] = std::exp(z[i] - max_z);
+        sum += p[i];
+    }
+    
+    for (int i = 0; i < n; i++) {
+        p[i] /= sum;
+    }
+}
+
+/// Compute entropy of a probability distribution.
+static double computeEntropy(const double* p, int n) {
+    double H = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (p[i] > 1e-6) {
+            H -= p[i] * std::log(p[i]);
+        }
+    }
+    return H;
+}
+
+// === Public Functions ===
+
 void initNetwork() {
     globalInitNetworkCalled = true;
+    
+    // Initialize actor network with Xavier initialization
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         actor_b1[i] = xavier_init(NUM_INPUTS, HIDDEN_SIZE);
-        critic_b1[i] = xavier_init(NUM_INPUTS, HIDDEN_SIZE);
         for (int j = 0; j < NUM_INPUTS; j++) {
             actor_W1[i][j] = xavier_init(NUM_INPUTS, HIDDEN_SIZE);
-            critic_W1[i][j] = xavier_init(NUM_INPUTS, HIDDEN_SIZE);
-            critic_W1_target[i][j] = critic_W1[i][j];
         }
-        critic_b1_target[i] = critic_b1[i];
     }
+    
     for (int k = 0; k < ACTOR_OUTPUTS; k++) {
         actor_b2[k] = xavier_init(HIDDEN_SIZE, ACTOR_OUTPUTS);
         for (int i = 0; i < HIDDEN_SIZE; i++) {
             actor_W2[k][i] = xavier_init(HIDDEN_SIZE, ACTOR_OUTPUTS);
         }
     }
+    
+    // Initialize critic network with Xavier initialization
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        critic_b1[i] = xavier_init(NUM_INPUTS, HIDDEN_SIZE);
+        for (int j = 0; j < NUM_INPUTS; j++) {
+            critic_W1[i][j] = xavier_init(NUM_INPUTS, HIDDEN_SIZE);
+        }
+    }
+    
     critic_b2[0] = xavier_init(HIDDEN_SIZE, 1);
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         critic_W2[0][i] = xavier_init(HIDDEN_SIZE, 1);
-        critic_W2_target[0][i] = critic_W2[0][i];
     }
-    critic_b2_target[0] = critic_b2[0];
     
     actor_time = 1;
     critic_time = 1;
 }
 
-// --- Polyak update for target critic ---
-static void polyakUpdate() {
-    for (int i = 0; i < HIDDEN_SIZE; i++) {
-        for (int j = 0; j < NUM_INPUTS; j++) {
-            critic_W1_target[i][j] = POLYAK * critic_W1[i][j] + (1 - POLYAK) * critic_W1_target[i][j];
-        }
-        critic_b1_target[i] = POLYAK * critic_b1[i] + (1 - POLYAK) * critic_b1_target[i];
+int runNeuralNetwork(Quadruped* quad, double reward, double out_actions[ACTOR_OUTPUTS]) {
+    // Clip rewards to reasonable range
+    if (reward > -100.0) {
+        reward = clamp(reward, -50.0, 50.0);
+    } else {
+        reward = clamp(reward, -500.0, 50.0);
     }
-    for (int i = 0; i < HIDDEN_SIZE; i++) {
-        critic_W2_target[0][i] = POLYAK * critic_W2[0][i] + (1 - POLYAK) * critic_W2_target[0][i];
-    }
-    critic_b2_target[0] = POLYAK * critic_b2[0] + (1 - POLYAK) * critic_b2_target[0];
-}
-
-// --- Softmax function ---
-static void softmax(const double *z, int n, double *p) {
-    double max_z = z[0];
-    for (int i = 1; i < n; i++) {
-        if (z[i] > max_z)
-            max_z = z[i];
-    }
-    double sum = 0.0;
-    for (int i = 0; i < n; i++) {
-        p[i] = exp(z[i] - max_z);
-        sum += p[i];
-    }
-    for (int i = 0; i < n; i++) {
-        p[i] /= sum;
-    }
-}
-
-// --- Compute entropy of a probability vector ---
-static double computeEntropy(const double *p, int n) {
-    double H = 0.0;
-    for (int i = 0; i < n; i++) {
-        if (p[i] > 1e-6)
-            H -= p[i] * log(p[i]);
-    }
-    return H;
-}
-
-/******************************************************************************
- * runNeuralNetwork: Run the actor–critic update.
- ******************************************************************************
- * This function implements the forward and backward passes for both the
- * actor and critic networks and updates their weights using the Adam
- * optimizer.
- */
-void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_OUTPUTS])
-{
+    
+    // === Build Input Vector ===
     double input[NUM_INPUTS];
-    // --- Build the input vector ---
-    // 1. Sensor ray values.
+    
+    // Sensor ray values (already in [0,1])
     for (int i = 0; i < NUM_RAYS; i++) {
         input[i] = quad->sensorValues[i];
     }
-    // 2. Target distance.
-    input[NUM_RAYS] = quad->distanceToTarget;
-    // 3. Current x position.
-    input[NUM_RAYS + 1] = quad->x;
-    // 4. Current y position.
-    input[NUM_RAYS + 2] = quad->y;
-    // 5. Current orientation.
-    input[NUM_RAYS + 3] = quad->orientation;
     
-    // --- Actor forward pass ---
+    // Normalized target distance
+    input[NUM_RAYS] = clamp(quad->distanceToTarget / 150.0, 0.0, 1.0);
+    
+    // Normalized position
+    input[NUM_RAYS + 1] = (quad->x - WORLD_X_MIN) / WORLD_WIDTH;
+    input[NUM_RAYS + 2] = (quad->y - WORLD_Y_MIN) / WORLD_HEIGHT;
+    
+    // Normalized orientation
+    input[NUM_RAYS + 3] = (quad->orientation + M_PI) / (2 * M_PI);
+    
+    // Relative angle to target (sin/cos encoding)
+    double targetAngle = std::atan2(quad->targetY - quad->y, quad->targetX - quad->x);
+    double relativeAngle = targetAngle - quad->orientation;
+    input[NUM_RAYS + 4] = std::sin(relativeAngle);
+    input[NUM_RAYS + 5] = std::cos(relativeAngle);
+    
+    // Ball visibility features
+    input[NUM_RAYS + 6] = quad->ballVisible ? 1.0 : 0.0;
+    input[NUM_RAYS + 7] = clamp(quad->ballVisionValue, 0.0, 1.0);
+    
+    // === Actor Forward Pass ===
     double actor_z1[HIDDEN_SIZE], actor_h1[HIDDEN_SIZE];
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         actor_z1[i] = actor_b1[i];
@@ -184,6 +204,7 @@ void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_O
         }
         actor_h1[i] = relu(actor_z1[i]);
     }
+    
     double actor_z2[ACTOR_OUTPUTS];
     for (int k = 0; k < ACTOR_OUTPUTS; k++) {
         actor_z2[k] = actor_b2[k];
@@ -191,11 +212,12 @@ void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_O
             actor_z2[k] += actor_W2[k][i] * actor_h1[i];
         }
     }
+    
     double policy[ACTOR_OUTPUTS];
     softmax(actor_z2, ACTOR_OUTPUTS, policy);
     double entropy = computeEntropy(policy, ACTOR_OUTPUTS);
     
-    // --- Critic forward pass (online) ---
+    // === Critic Forward Pass ===
     double critic_z1[HIDDEN_SIZE], critic_h1[HIDDEN_SIZE];
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         critic_z1[i] = critic_b1[i];
@@ -204,31 +226,30 @@ void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_O
         }
         critic_h1[i] = relu(critic_z1[i]);
     }
+    
     double critic_value = critic_b2[0];
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         critic_value += critic_W2[0][i] * critic_h1[i];
     }
     
-    // --- Critic forward pass (target) ---
-    double critic_target_z1[HIDDEN_SIZE], critic_target_h1[HIDDEN_SIZE];
-    for (int i = 0; i < HIDDEN_SIZE; i++) {
-        critic_target_z1[i] = critic_b1_target[i];
-        for (int j = 0; j < NUM_INPUTS; j++) {
-            critic_target_z1[i] += critic_W1_target[i][j] * input[j];
-        }
-        critic_target_h1[i] = relu(critic_target_z1[i]);
-    }
-    double critic_target_value = critic_b2_target[0];
-    for (int i = 0; i < HIDDEN_SIZE; i++) {
-        critic_target_value += critic_W2_target[0][i] * critic_target_h1[i];
+    // === TD Error Calculation ===
+    bool is_terminal = (reward <= -100.0 || reward >= 40.0);
+    double td_error;
+    
+    if (is_terminal) {
+        td_error = reward - quad->prevCriticValue;
+    } else {
+        double td_target = reward + GAMMA * critic_value;
+        td_error = td_target - quad->prevCriticValue;
     }
     
-    // --- TD error and advantage ---
-    double td_error = reward + GAMMA * critic_target_value - quad->prevCriticValue;
-    double advantage = td_error + ALPHA_ENTROPY * entropy;
+    quad->prevCriticValue = critic_value;
     
-    // --- Action selection: sample from policy distribution ---
-    double r = (double)rand() / RAND_MAX;
+    // Advantage for actor (includes entropy bonus)
+    double actor_advantage = td_error + ENTROPY_COEFF * entropy;
+    
+    // === Action Selection (Stochastic) ===
+    double r = static_cast<double>(std::rand()) / RAND_MAX;
     double cumulative = 0.0;
     int chosen_action = 0;
     for (int i = 0; i < ACTOR_OUTPUTS; i++) {
@@ -238,180 +259,235 @@ void runNeuralNetwork(Quadruped *quad, double reward, double out_actions[ACTOR_O
             break;
         }
     }
+    
+    // Store policy probabilities in output
     for (int i = 0; i < ACTOR_OUTPUTS; i++) {
         out_actions[i] = policy[i];
     }
     
-    // --- Compute gradients for actor using softmax derivative ---
+    // === Actor Gradient Computation ===
     double d_actor_z2[ACTOR_OUTPUTS];
     for (int i = 0; i < ACTOR_OUTPUTS; i++) {
         double one_hot = (i == chosen_action) ? 1.0 : 0.0;
-        d_actor_z2[i] = (one_hot - policy[i]) * advantage;
+        d_actor_z2[i] = (one_hot - policy[i]) * actor_advantage;
     }
     
-    // --- Backpropagate actor: update actor_W2 and actor_b2 ---
+    // Accumulate actor layer 2 gradients
     for (int k = 0; k < ACTOR_OUTPUTS; k++) {
-        adam_update(actor_b2[k], d_actor_z2[k], actor_b2_m[k], actor_b2_v[k], actor_time, adamDefault);
+        actor_b2_grad[k] += d_actor_z2[k];
         for (int i = 0; i < HIDDEN_SIZE; i++) {
-            double grad = d_actor_z2[k] * actor_h1[i];
-            adam_update(actor_W2[k][i], grad, actor_W2_m[k][i], actor_W2_v[k][i], actor_time, adamDefault);
+            actor_W2_grad[k][i] += d_actor_z2[k] * actor_h1[i];
         }
     }
     
-    // --- Backpropagate to layer 1 for actor ---
+    // Backpropagate to actor layer 1
     double d_actor_h1[HIDDEN_SIZE] = {0};
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         for (int k = 0; k < ACTOR_OUTPUTS; k++) {
             d_actor_h1[i] += actor_W2[k][i] * d_actor_z2[k];
         }
     }
+    
     double d_actor_z1[HIDDEN_SIZE];
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         d_actor_z1[i] = d_actor_h1[i] * drelu(actor_z1[i]);
     }
+    
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-        adam_update(actor_b1[i], d_actor_z1[i], actor_b1_m[i], actor_b1_v[i], actor_time, adamDefault);
+        actor_b1_grad[i] += d_actor_z1[i];
         for (int j = 0; j < NUM_INPUTS; j++) {
-            double grad = d_actor_z1[i] * input[j];
-            adam_update(actor_W1[i][j], grad, actor_W1_m[i][j], actor_W1_v[i][j], actor_time, adamDefault);
+            actor_W1_grad[i][j] += d_actor_z1[i] * input[j];
         }
     }
-    actor_time++;
     
-    // --- Critic update ---
+    // === Critic Gradient Computation ===
     double d_critic = td_error;
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-        double grad = d_critic * critic_h1[i];
-        adam_update(critic_W2[0][i], grad, critic_W2_m[i], critic_W2_v[i], critic_time, adamDefault);
+        critic_W2_grad[i] += d_critic * critic_h1[i];
     }
-    adam_update(critic_b2[0], d_critic, critic_b2_m, critic_b2_v, critic_time, adamDefault);
+    critic_b2_grad += d_critic;
     
     double d_critic_h1[HIDDEN_SIZE] = {0};
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         d_critic_h1[i] = critic_W2[0][i] * d_critic;
     }
+    
     double d_critic_z1[HIDDEN_SIZE];
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         d_critic_z1[i] = d_critic_h1[i] * drelu(critic_z1[i]);
     }
+    
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-        adam_update(critic_b1[i], d_critic_z1[i], critic_b1_m[i], critic_b1_v[i], critic_time, adamDefault);
+        critic_b1_grad[i] += d_critic_z1[i];
         for (int j = 0; j < NUM_INPUTS; j++) {
-            double grad = d_critic_z1[i] * input[j];
-            adam_update(critic_W1[i][j], grad, critic_W1_m[i][j], critic_W1_v[i][j], critic_time, adamDefault);
+            critic_W1_grad[i][j] += d_critic_z1[i] * input[j];
+        }
+    }
+    
+    batch_count++;
+    
+    // Trigger visual feedback for large TD errors
+    if (std::fabs(td_error) > 10000.0) {
+        globalWeightChangeBlink = 1.0;
+    }
+    
+    return chosen_action;
+}
+
+void applyBatchUpdate() {
+    if (batch_count == 0) return;
+    
+    double batch_size = static_cast<double>(batch_count);
+    
+    // Apply actor updates with averaged gradients
+    for (int k = 0; k < ACTOR_OUTPUTS; k++) {
+        double avg_grad = actor_b2_grad[k] / batch_size;
+        adam_update(actor_b2[k], avg_grad, actor_b2_m[k], actor_b2_v[k], actor_time, ACTOR_LR);
+        
+        for (int i = 0; i < HIDDEN_SIZE; i++) {
+            avg_grad = actor_W2_grad[k][i] / batch_size;
+            adam_update(actor_W2[k][i], avg_grad, actor_W2_m[k][i], actor_W2_v[k][i], actor_time, ACTOR_LR);
+        }
+    }
+    
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        double avg_grad = actor_b1_grad[i] / batch_size;
+        adam_update(actor_b1[i], avg_grad, actor_b1_m[i], actor_b1_v[i], actor_time, ACTOR_LR);
+        
+        for (int j = 0; j < NUM_INPUTS; j++) {
+            avg_grad = actor_W1_grad[i][j] / batch_size;
+            adam_update(actor_W1[i][j], avg_grad, actor_W1_m[i][j], actor_W1_v[i][j], actor_time, ACTOR_LR);
+        }
+    }
+    actor_time++;
+    
+    // Apply critic updates with averaged gradients
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        double avg_grad = critic_W2_grad[i] / batch_size;
+        adam_update(critic_W2[0][i], avg_grad, critic_W2_m[i], critic_W2_v[i], critic_time, CRITIC_LR);
+    }
+    
+    double avg_grad = critic_b2_grad / batch_size;
+    adam_update(critic_b2[0], avg_grad, critic_b2_m, critic_b2_v, critic_time, CRITIC_LR);
+    
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        avg_grad = critic_b1_grad[i] / batch_size;
+        adam_update(critic_b1[i], avg_grad, critic_b1_m[i], critic_b1_v[i], critic_time, CRITIC_LR);
+        
+        for (int j = 0; j < NUM_INPUTS; j++) {
+            avg_grad = critic_W1_grad[i][j] / batch_size;
+            adam_update(critic_W1[i][j], avg_grad, critic_W1_m[i][j], critic_W1_v[i][j], critic_time, CRITIC_LR);
         }
     }
     critic_time++;
     
-    // --- Update stored critic value ---
-    quad->prevCriticValue = critic_value;
+    // Reset gradient accumulators
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        actor_b1_grad[i] = 0;
+        critic_b1_grad[i] = 0;
+        for (int j = 0; j < NUM_INPUTS; j++) {
+            actor_W1_grad[i][j] = 0;
+            critic_W1_grad[i][j] = 0;
+        }
+    }
     
-    // --- Polyak update for target critic ---
-    polyakUpdate();
+    for (int k = 0; k < ACTOR_OUTPUTS; k++) {
+        actor_b2_grad[k] = 0;
+        for (int i = 0; i < HIDDEN_SIZE; i++) {
+            actor_W2_grad[k][i] = 0;
+        }
+    }
     
-    // --- Global weight change blink trigger ---
-    if (fabs(td_error) > 2000.0)
-        globalWeightChangeBlink = 1.0;
-    
-    // --- (Optional) Export network parameters to CSV ---
-    // Now using std::string for CSV serialization.
-    std::string csvData = serializeNetworkToCSV(
-    input,
-    actor_z1,
-    actor_h1,
-    actor_z2,
-    policy,
-    chosen_action,
-    entropy,
-    critic_z1,
-    critic_h1,
-    critic_value,
-    reward,
-    td_error,
-    advantage
-);
-    writeCSVData("network_parameters.csv", csvData.c_str());
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        critic_W2_grad[i] = 0;
+    }
+    critic_b2_grad = 0;
+    batch_count = 0;
 }
 
-// --- CSV Serialization Function ---
-// This new function logs both network parameters and key runtime values.
-// You may need to call this function from runNeuralNetwork(), passing the computed values.
 std::string serializeNetworkToCSV(
     const double input[NUM_INPUTS],
-    const double actor_z1[HIDDEN_SIZE],
-    const double actor_h1[HIDDEN_SIZE],
-    const double actor_z2[ACTOR_OUTPUTS],
+    const double actor_z1_arr[HIDDEN_SIZE],
+    const double actor_h1_arr[HIDDEN_SIZE],
+    const double actor_z2_arr[ACTOR_OUTPUTS],
     const double policy[ACTOR_OUTPUTS],
     int chosen_action,
     double entropy,
-    const double critic_z1[HIDDEN_SIZE],
-    const double critic_h1[HIDDEN_SIZE],
+    const double critic_z1_arr[HIDDEN_SIZE],
+    const double critic_h1_arr[HIDDEN_SIZE],
     double critic_value,
     double reward,
     double td_error,
-    double advantage)
-{
+    double advantage) {
+    
     std::ostringstream oss;
-    // CSV header with a new Category field for clarity.
     oss << "Category,Layer,Index1,Index2,Value\n";
     
-    // Log Input Values.
+    // Input values
     for (int i = 0; i < NUM_INPUTS; i++) {
-         oss << "Input,,," << i << "," << input[i] << "\n";
+        oss << "Input,,," << i << "," << input[i] << "\n";
     }
     
-    // Log Actor Network Intermediate Values.
+    // Actor intermediate values
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-         oss << "Actor_z1,Layer1," << i << ",," << actor_z1[i] << "\n";
-         oss << "Actor_h1,Layer1," << i << ",," << actor_h1[i] << "\n";
+        oss << "Actor_z1,Layer1," << i << ",," << actor_z1_arr[i] << "\n";
+        oss << "Actor_h1,Layer1," << i << ",," << actor_h1_arr[i] << "\n";
     }
+    
     for (int k = 0; k < ACTOR_OUTPUTS; k++) {
-         oss << "Actor_z2,Layer2," << k << ",," << actor_z2[k] << "\n";
-         oss << "Policy,Layer2," << k << ",," << policy[k] << "\n";
+        oss << "Actor_z2,Layer2," << k << ",," << actor_z2_arr[k] << "\n";
+        oss << "Policy,Layer2," << k << ",," << policy[k] << "\n";
     }
+    
     oss << "Chosen_Action,Output,,," << chosen_action << "\n";
     oss << "Entropy,Output,,," << entropy << "\n";
     
-    // Log Critic Network Intermediate Values.
+    // Critic intermediate values
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-         oss << "Critic_z1,Layer1," << i << ",," << critic_z1[i] << "\n";
-         oss << "Critic_h1,Layer1," << i << ",," << critic_h1[i] << "\n";
+        oss << "Critic_z1,Layer1," << i << ",," << critic_z1_arr[i] << "\n";
+        oss << "Critic_h1,Layer1," << i << ",," << critic_h1_arr[i] << "\n";
     }
+    
     oss << "Critic_Value,Output,,," << critic_value << "\n";
     
-    // Log Learning Metrics.
+    // Learning metrics
     oss << "Reward,,,," << reward << "\n";
     oss << "TD_Error,,,," << td_error << "\n";
     oss << "Advantage,,,," << advantage << "\n";
     
-    // Log Actor Network Parameters.
+    // Actor weights
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         for (int j = 0; j < NUM_INPUTS; j++) {
             oss << "actor_W1,Layer1," << i << "," << j << "," << actor_W1[i][j] << "\n";
         }
     }
+    
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-         oss << "actor_b1,Layer1," << i << ",," << actor_b1[i] << "\n";
-    }
-    for (int k = 0; k < ACTOR_OUTPUTS; k++) {
-         for (int i = 0; i < HIDDEN_SIZE; i++) {
-             oss << "actor_W2,Layer2," << k << "," << i << "," << actor_W2[k][i] << "\n";
-         }
-         oss << "actor_b2,Layer2," << k << ",," << actor_b2[k] << "\n";
+        oss << "actor_b1,Layer1," << i << ",," << actor_b1[i] << "\n";
     }
     
-    // Log Critic Network Parameters.
-    for (int i = 0; i < HIDDEN_SIZE; i++) {
-         for (int j = 0; j < NUM_INPUTS; j++) {
-             oss << "critic_W1,Layer1," << i << "," << j << "," << critic_W1[i][j] << "\n";
-         }
+    for (int k = 0; k < ACTOR_OUTPUTS; k++) {
+        for (int i = 0; i < HIDDEN_SIZE; i++) {
+            oss << "actor_W2,Layer2," << k << "," << i << "," << actor_W2[k][i] << "\n";
+        }
+        oss << "actor_b2,Layer2," << k << ",," << actor_b2[k] << "\n";
     }
+    
+    // Critic weights
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-         oss << "critic_b1,Layer1," << i << ",," << critic_b1[i] << "\n";
+        for (int j = 0; j < NUM_INPUTS; j++) {
+            oss << "critic_W1,Layer1," << i << "," << j << "," << critic_W1[i][j] << "\n";
+        }
     }
+    
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-         oss << "critic_W2,Output,0," << i << "," << critic_W2[0][i] << "\n";
+        oss << "critic_b1,Layer1," << i << ",," << critic_b1[i] << "\n";
     }
+    
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        oss << "critic_W2,Output,0," << i << "," << critic_W2[0][i] << "\n";
+    }
+    
     oss << "critic_b2,Output,0,," << critic_b2[0] << "\n";
     
     return oss.str();

@@ -1,0 +1,42 @@
+# === Build Artifacts ===
+build/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+
+# Executables
+multisim
+demo_hallway
+multiSim2
+demo_multisim
+
+# === Runtime Outputs ===
+network_parameters.csv
+*.log
+
+# === IDE and Editor ===
+.vscode/
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+
+# === macOS ===
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# === Compiled Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+
+# === Temporary Files ===
+*.tmp
+*.temp
